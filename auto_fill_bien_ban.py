@@ -1034,8 +1034,9 @@ def get_peripheral_history():
                                 or lower in ("usb composite device", "usb composite")
                                 or not friendly):
                             continue
+                        # Chỉ nhận diện các loại có ý nghĩa; còn lại để None -> sẽ đếm gộp
                         items.append({
-                            "loai": "Thiết bị USB khác",
+                            "loai": _phan_loai_usb_khac(friendly),
                             "ten": friendly,
                             "serial": inst_name,
                             "dung_luong": "-",
@@ -1055,14 +1056,44 @@ def get_peripheral_history():
             unique_items.append(it)
     return unique_items
 
+def _phan_loai_usb_khac(ten):
+    """Phân loại thiết bị USB (ngoài nhóm lưu trữ/điện thoại/máy in) theo tên.
+    Chỉ nhận diện các loại có ý nghĩa với biên bản: chuột, bàn phím, máy in, điện thoại.
+    Trả về tên loại, hoặc None nếu không rõ (sẽ được đếm gộp thay vì liệt kê chi tiết)."""
+    t = (ten or "").lower()
+    if any(k in t for k in ("mouse", "chuột")):
+        return "Chuột"
+    if any(k in t for k in ("keyboard", "bàn phím")):
+        return "Bàn phím"
+    if any(k in t for k in ("printer", "printing", "laserjet", "lbp", "mfp", "in ", "máy in")):
+        return "Máy in"
+    if any(k in t for k in ("phone", "iphone", "android", "galaxy", "xiaomi", "oppo", "mobile")):
+        return "Điện thoại di động"
+    return None  # webcam, bluetooth, vân tay, USB Input Device chung chung... -> không rõ, đếm gộp
+
+
+# Các loại thiết bị có ý nghĩa cần liệt kê chi tiết trong biên bản
+_LOAI_CO_NGHIA = ("USB (thiết bị lưu trữ)", "Ổ cứng gắn ngoài (USB)", "Điện thoại di động",
+                  "Điện thoại (chế độ lưu trữ)", "Điện thoại / Thiết bị di động",
+                  "Thẻ nhớ / Đầu đọc thẻ", "Máy in (kết nối USB)", "Máy in", "Chuột", "Bàn phím")
+
+
 def format_peripheral_history_text(items, max_items=25):
     if not items:
         return ["Không."]
+    # Tách thiết bị nhận diện được (liệt kê chi tiết) và thiết bị không rõ loại (chỉ đếm số lượng)
+    biet = [it for it in items if it.get("loai")]
+    khong_ro = [it for it in items if not it.get("loai")]
     lines = []
-    for idx, it in enumerate(items[:max_items], start=1):
-        lines.append(f'{idx}. Loại: {it["loai"]} | Seri: {it["serial"]} | Dung lượng: {it["dung_luong"]} | Tên: {it["ten"]}')
-    if len(items) > max_items:
-        lines.append(f"... và {len(items) - max_items} thiết bị khác.")
+    idx = 1
+    for it in biet[:max_items]:
+        lines.append(f'{idx}. Loại: {it["loai"]} | Seri: {it["serial"]} | '
+                     f'Dung lượng: {it["dung_luong"]} | Tên: {it["ten"]}')
+        idx += 1
+    if len(biet) > max_items:
+        lines.append(f"... và {len(biet) - max_items} thiết bị đã nhận diện khác.")
+    if khong_ro:
+        lines.append(f"{idx}. Thiết bị khác: {len(khong_ro)} thiết bị (không rõ tên loại thiết bị).")
     return lines
 
 def get_installed_hotfixes():
@@ -1160,28 +1191,45 @@ def doc_ngay_du_lieu(path):
 
 
 def scan_os_vulnerabilities(vuln_file_path, os_build, os_ubr=None):
+    """Đối chiếu lỗ hổng với 2 mức độ tin cậy:
+      - confirmed: khẳng định CHƯA vá vì số bản dựng của máy < bản dựng đã vá (đáng tin).
+      - can_verify: chỉ đối chiếu được theo mã KB (KB không có trong Get-HotFix). Trên máy Windows 10/11
+        cập nhật tích lũy, KB cũ đã bị thay thế nên KHÔNG còn xuất hiện dù máy đã vá -> tín hiệu này
+        KHÔNG đáng tin, chỉ đưa ra để kiểm tra viên xác minh thủ công (tránh báo hàng trăm lỗ hổng oan).
+    Trả về (confirmed_list, can_verify_cves)."""
     installed = get_installed_hotfixes()
     entries = parse_vuln_file(vuln_file_path)
-    findings = []
+    confirmed, can_verify = [], []
     for e in entries:
-        patched = any(kb in installed for kb in e["kbs"])
-        if not patched and _da_va_theo_build(e["fixed_builds"], os_build, os_ubr):
-            patched = True
-        if not patched and e["kbs"]:
-            findings.append(f'{e["cve"]} - {e["name"]} (Mức độ: {e["severity"]}) - CHƯA phát hiện bản vá')
-    return findings
+        if any(kb in installed for kb in e["kbs"]):
+            continue  # đã có KB vá -> bỏ qua
+        if e["fixed_builds"]:
+            if not _da_va_theo_build(e["fixed_builds"], os_build, os_ubr):
+                confirmed.append(f'{e["cve"]} - {e["name"]} (Mức độ: {e["severity"]}) - CHƯA phát hiện bản vá')
+            # nếu build >= mốc vá -> đã vá, bỏ qua
+        elif e["kbs"]:
+            can_verify.append(e["cve"])  # chỉ có KB, không có dữ liệu bản dựng -> cần xác minh
+    return confirmed, can_verify
 
-def format_vuln_text(findings):
-    if not findings:
-        return ["Không phát hiện lỗ hổng chưa có bản vá trong danh sách đối chiếu."]
-    cves = []
-    for f in findings:
-        m = re.search(r"CVE-\d{4}-\d+", f)
-        if m:
-            cves.append(m.group(0))
-    if not cves:
-        cves = [str(f).split(" - ")[0] for f in findings]
-    return [f"Phát hiện {len(findings)} lỗ hổng chưa có bản vá (gồm: {'; '.join(cves)})."]
+
+def format_vuln_text(findings, can_verify=None):
+    can_verify = can_verify or []
+    lines = []
+    if findings:
+        cves = []
+        for f in findings:
+            m = re.search(r"CVE-\d{4}-\d+", f)
+            cves.append(m.group(0) if m else str(f).split(" - ")[0])
+        # Giữ nguyên cụm "Phát hiện N lỗ hổng chưa có bản vá (gồm: ...)" để công cụ tổng hợp bóc tách được
+        lines.append(f"Phát hiện {len(findings)} lỗ hổng chưa có bản vá, đối chiếu theo bản dựng hệ điều hành "
+                     f"(gồm: {'; '.join(cves)}).")
+    else:
+        lines.append("Không phát hiện lỗ hổng chưa có bản vá (đối chiếu theo số bản dựng hệ điều hành).")
+    if can_verify:
+        lines.append(f"Lưu ý: còn {len(can_verify)} lỗ hổng trong danh sách chỉ đối chiếu được theo mã bản vá (KB), "
+                     f"chưa kết luận chắc chắn trên máy đã cập nhật tích lũy - cần xác minh thủ công. "
+                     f"(Khuyến nghị cập nhật lại dữ liệu CVE có cột số bản dựng để kết luận chính xác.)")
+    return lines
 
 def parse_malware_signatures(path):
     families = []
@@ -1736,8 +1784,8 @@ def fill_form(template_path, output_path, malware_file, vuln_file, manual_data=N
     if not os.path.exists(vuln_file):
         vuln_lines = ["CẢNH BÁO: Không tìm thấy file danh sách CVE; bỏ qua bước đối chiếu lỗ hổng."]
     else:
-        vuln_findings = scan_os_vulnerabilities(vuln_file, os_info["build"], os_info.get("ubr"))
-        vuln_lines = format_vuln_text(vuln_findings)
+        vuln_findings, vuln_can_verify = scan_os_vulnerabilities(vuln_file, os_info["build"], os_info.get("ubr"))
+        vuln_lines = format_vuln_text(vuln_findings, vuln_can_verify)
 
     step(8, "Đang đối chiếu dấu hiệu mã độc (IOC)...")
     malware_findings = []
@@ -1833,6 +1881,22 @@ def fill_form(template_path, output_path, malware_file, vuln_file, manual_data=N
         tick_checkbox_nth(p10, 0)
     elif password_status is False:
         tick_checkbox_nth(p10, 1)
+
+    # p11: "Có cung cấp mật khẩu cho người khác: có [] không []" - tích theo lựa chọn của kiểm tra viên
+    cung_cap = str(manual_data.get("cung_cap_mk", "")).lower()
+    p11 = doc.paragraphs[11]
+    if cung_cap == "co":
+        tick_checkbox_nth(p11, 0)
+    elif cung_cap == "khong":
+        tick_checkbox_nth(p11, 1)
+    # p12: "Nếu có (ghi cụ thông tin về người được cung cấp): ..."
+    if cung_cap == "co" and manual_data.get("nguoi_duoc_cap"):
+        p12 = doc.paragraphs[12]
+        merge_para_runs(p12)
+        if p12.runs:
+            p12.runs[0].text = p12.runs[0].text.rstrip() + " " + manual_data["nguoi_duoc_cap"]
+        else:
+            p12.add_run(" " + manual_data["nguoi_duoc_cap"]).font.name = "Times New Roman"
 
     p13 = doc.paragraphs[13]
     if network_class == "noi_bo":
@@ -2262,6 +2326,22 @@ def run_gui_app(template_path, output_path, malware_file, vuln_file):
             ent.insert(0, default_time[key])
         _bind_auto_cap(ent)
         entries[key] = ent
+
+    # Ô chọn "Có cung cấp mật khẩu cho người khác" (tự tích Có/Không vào biên bản) + người được cung cấp
+    cc_row = len(MANUAL_FIELDS_DEF)
+    ttk.Label(form_frame, text="Có cung cấp mật khẩu cho người khác",
+              style="Field.TLabel").grid(row=cc_row, column=0, sticky="w", pady=5)
+    cung_cap_var = tk.StringVar(value="Không")
+    cung_cap_combo = ttk.Combobox(form_frame, textvariable=cung_cap_var, values=["Không", "Có"],
+                                  state="readonly", width=39, font=("Segoe UI", 10))
+    cung_cap_combo.grid(row=cc_row, column=1, sticky="ew", padx=15, pady=5)
+
+    ttk.Label(form_frame, text="Người được cung cấp (nếu có)",
+              style="Field.TLabel").grid(row=cc_row + 1, column=0, sticky="w", pady=5)
+    nguoi_cap_ent = ttk.Entry(form_frame, width=42, font=("Segoe UI", 10))
+    nguoi_cap_ent.grid(row=cc_row + 1, column=1, sticky="ew", padx=15, pady=5)
+    _bind_auto_cap(nguoi_cap_ent)
+
     form_frame.columnconfigure(1, weight=1)
 
     status_label = ttk.Label(root, text="", foreground="#374151", font=("Segoe UI", 9),
@@ -2411,6 +2491,9 @@ def run_gui_app(template_path, output_path, malware_file, vuln_file):
         manual_data = {key: ent.get().strip() for key, ent in entries.items()}
         # LUÔN tự viết hoa chữ cái đầu mỗi từ
         manual_data = {key: auto_capitalize(value) for key, value in manual_data.items()}
+        # Lựa chọn cung cấp mật khẩu cho người khác (tự tích vào biên bản)
+        manual_data["cung_cap_mk"] = "co" if cung_cap_var.get() == "Có" else "khong"
+        manual_data["nguoi_duoc_cap"] = auto_capitalize(nguoi_cap_ent.get().strip())
 
         want_admin = False
         if not is_admin():

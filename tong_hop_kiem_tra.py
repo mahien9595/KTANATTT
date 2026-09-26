@@ -568,12 +568,21 @@ def parse_sidecar(payload, file_path, muc_do_cve=None):
     ho_ma_doc = payload.get("malware_families") or []
     cves = [c.upper() for c in (payload.get("vuln_cves") or [])]
 
-    usb, seri = [], []
+    # Chỉ liệt kê thiết bị nhận diện được loại; thiết bị không rõ loại chỉ đếm số lượng.
+    # Số seri (để phát hiện USB "cầu nối") chỉ lấy từ thiết bị lưu trữ (USB/ổ cứng ngoài).
+    usb, seri, so_khong_ro = [], [], 0
     for it in payload.get("peripherals") or []:
+        loai = (it.get("loai") or "").strip()
         ten = (it.get("ten") or "").strip()
         s = (it.get("serial") or "").strip()
-        usb.append(f"{ten} [{it.get('loai','')}, {it.get('dung_luong','')}] (Seri: {s})")
-        seri.append(s)
+        if not loai:
+            so_khong_ro += 1
+            continue
+        usb.append(f"{ten} [{loai}, {it.get('dung_luong','')}] (Seri: {s})")
+        if any(k in loai.lower() for k in ("lưu trữ", "ổ cứng", "usb")):
+            seri.append(s)
+    if so_khong_ro:
+        usb.append(f"{so_khong_ro} thiết bị khác (không rõ tên loại thiết bị)")
 
     data = {
         "File_Path": file_path,
@@ -584,7 +593,7 @@ def parse_sidecar(payload, file_path, muc_do_cve=None):
         "Chuc_Vu_KT": manual.get("chuc_vu", ""),
         "Can_Bo_Quan_Ly": manual.get("ten_doi_tuong", "") or "Không rõ",
         "Mat_Khau": {True: "Có đặt mật khẩu", False: "Không đặt MK"}.get(ph, "Không rõ"),
-        "Cung_Cap_MK": "Không rõ",
+        "Cung_Cap_MK": {"co": "Có", "khong": "Không"}.get(str(manual.get("cung_cap_mk", "")).lower(), "Không rõ"),
         "Phan_Loai_May": phan_loai,
         "Ten_May": payload.get("computer_name", "") or "Không rõ",
         "He_Dieu_Hanh": payload.get("os_display") or payload.get("os_caption", "") or "Không rõ",

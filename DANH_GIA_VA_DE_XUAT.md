@@ -115,6 +115,19 @@ thanh trạng thái dữ liệu (ngày CVE/IOC, số mục) và quyền Administ
 
 > Bộ đọc docx dự phòng của công cụ tổng hợp đã được cập nhật để đọc được cả định dạng đoạn văn mới lẫn định dạng cũ.
 
+### Bổ sung tiếp (đợt sau)
+
+- **Ô "Có cung cấp mật khẩu cho người khác" trên giao diện:** kiểm tra viên chọn Có/Không (và tên người được
+  cung cấp nếu có); biên bản tự tích ô tương ứng và điền dòng "Nếu có (...)".
+- **Sửa đếm lỗ hổng sai (báo 179 lỗ hổng oan):** trước đây đối chiếu chỉ theo mã KB, nên máy Windows 10 cập nhật
+  tích lũy bị coi là thiếu gần như mọi KB cũ (đã bị thay thế) → báo hàng trăm lỗ hổng không đúng, gồm cả lỗ hổng của
+  Windows 7/8 không áp dụng. Nay **chỉ khẳng định "chưa có bản vá" khi đối chiếu được theo số bản dựng**; phần chỉ
+  có KB được tách thành ghi chú "cần xác minh thủ công" và **không tính vào số lượng lỗ hổng**. Muốn kết luận chính
+  xác đầy đủ, cập nhật lại dữ liệu CVE (có cột số bản dựng) qua công cụ tổng hợp.
+- **Lọc lại danh sách thiết bị ngoại vi:** chỉ liệt kê chi tiết các loại có ý nghĩa (USB lưu trữ, ổ cứng gắn ngoài,
+  điện thoại, máy in, chuột, bàn phím); các thiết bị nội bộ/không rõ (webcam, bluetooth, cảm biến vân tay,
+  "USB Input Device" chung chung...) chỉ **đếm số lượng**: "N thiết bị khác (không rõ tên loại thiết bị)".
+
 ## 3. Hạn chế còn tồn tại (chưa sửa — cần quyết định hướng đi)
 
 ### 3.1. Lưu ý về kết quả "lỗ hổng" (đã cải thiện ở giai đoạn 2, còn điểm cần biết)
