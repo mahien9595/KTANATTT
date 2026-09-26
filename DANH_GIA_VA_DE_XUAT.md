@@ -99,6 +99,22 @@ vì sai dữ liệu thì hàng trăm biên bản sai theo. Các thay đổi:
 **E. Giao diện:** công cụ tổng hợp dùng bộ style thống nhất (tab, bảng, nút, thẻ KPI); công cụ kiểm tra hiển thị
 thanh trạng thái dữ liệu (ngày CVE/IOC, số mục) và quyền Administrator ngay dưới banner.
 
+## 2d. Tinh chỉnh công cụ kiểm tra sau khi chạy thử thực tế
+
+- **Phát hiện mật khẩu đăng nhập chính xác:** dùng phép thử đăng nhập với mật khẩu rỗng (API LogonUser)
+  thay cho cờ `PasswordRequired` — cờ này vẫn báo "không" ngay cả khi máy đã đặt mật khẩu.
+- **Liệt kê đủ mọi ổ đĩa:** máy nhiều ổ (HDD + SSD) nay hiện tất cả kèm loại và dung lượng, thay vì chỉ ổ đầu tiên.
+- **Kiểm tra bản quyền Office:** ô "Phần mềm ứng dụng" thêm dòng bản quyền Office (hợp lệ/chưa kích hoạt);
+  Microsoft 365/Click-to-Run báo "có cài, cần kiểm tra thủ công".
+- **Thiết bị ngoại vi rõ loại + khử trùng:** phân loại USB / ổ cứng gắn ngoài / điện thoại / thẻ nhớ / máy in;
+  thiết bị cùng số seri chỉ hiện một lần.
+- **Định dạng đồng nhất:** mỗi kết quả kiểm tra là một đoạn văn riêng, thụt đầu dòng **1,27cm** thống nhất
+  (trước đây các dòng sau dòng đầu không thụt đầu dòng).
+- **Mục II.2 để trống:** công cụ chỉ điền kết quả cho mục II.1 (máy vi tính); mục II.2 (thiết bị khác) để trống
+  vì không kiểm tra trực tiếp được.
+
+> Bộ đọc docx dự phòng của công cụ tổng hợp đã được cập nhật để đọc được cả định dạng đoạn văn mới lẫn định dạng cũ.
+
 ## 3. Hạn chế còn tồn tại (chưa sửa — cần quyết định hướng đi)
 
 ### 3.1. Lưu ý về kết quả "lỗ hổng" (đã cải thiện ở giai đoạn 2, còn điểm cần biết)

@@ -502,6 +502,51 @@ def get_top_apps(n=2):
             break
     return ", ".join(unique_ordered) if unique_ordered else "Không xác định"
 
+
+_SPP_STATUS = {0: "Chưa cấp phép", 1: "Hợp lệ (đã kích hoạt)", 2: "Đang dùng thử (Grace)",
+               3: "Hết hạn dùng thử", 4: "Nghi không bản quyền (Non-Genuine)",
+               5: "Chưa kích hoạt (Notification)", 6: "Gia hạn dùng thử"}
+
+
+def get_office_license():
+    """Kiểm tra bản quyền Microsoft Office cài trên máy.
+    - Office bản quyền số lượng lớn/bán lẻ (MSI/KMS): đọc trạng thái qua SoftwareLicensingProduct.
+    - Microsoft 365 / Office click-to-run: SPP thường không có -> chỉ báo 'đã cài (không đọc được trạng thái)'.
+    Trả về chuỗi mô tả, hoặc '' nếu không phát hiện Office."""
+    if not IS_WINDOWS:
+        return ""
+    ket_qua = []
+    if USE_MODERN_CMDLETS:
+        cmd = ("Get-CimInstance SoftwareLicensingProduct -ErrorAction SilentlyContinue | "
+               "Where-Object {$_.Name -like '*Office*' -and $_.PartialProductKey} | "
+               "Select-Object Name, LicenseStatus")
+    else:
+        cmd = ("Get-WmiObject SoftwareLicensingProduct -ErrorAction SilentlyContinue | "
+               "Where-Object {$_.Name -like '*Office*' -and $_.PartialProductKey} | "
+               "Select-Object Name, LicenseStatus")
+    data = run_ps(cmd)
+    if isinstance(data, dict):
+        data = [data]
+    for d in data or []:
+        if not isinstance(d, dict):
+            continue
+        ten = str(d.get("Name") or "Office").strip()
+        ten = re.sub(r"\s*-\s*.*$", "", ten)  # rút gọn tên dài
+        tt = d.get("LicenseStatus")
+        ket_qua.append(f"{ten}: {_SPP_STATUS.get(tt, 'Không rõ trạng thái')}")
+
+    if not ket_qua:
+        # Không có trong SPP: dò cài đặt Office (Click-to-Run / Microsoft 365) qua registry
+        co_office = run_ps(r"(Test-Path 'HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration') -or "
+                           r"(Test-Path 'HKLM:\SOFTWARE\Microsoft\Office')")
+        if co_office is True:
+            ten = run_ps(r"(Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration' "
+                         r"-ErrorAction SilentlyContinue).ProductReleaseIds")
+            mo_ta = f" ({ten})" if isinstance(ten, str) and ten else ""
+            return f"Có cài Microsoft Office{mo_ta} - không đọc được trạng thái bản quyền (cần kiểm tra thủ công)"
+        return ""
+    return "; ".join(ket_qua)
+
 def get_computer_name():
     if IS_WINDOWS:
         return os.environ.get("COMPUTERNAME", "Không xác định")
@@ -550,17 +595,48 @@ def get_network_basic():
 
     return mac, ip
 
+_MEDIA_MAP = {0: "Không xác định", 3: "HDD", 4: "SSD", 5: "SCM (Optane)"}
+
+
+def _lay_danh_sach_o_cung():
+    """Lấy TẤT CẢ ổ đĩa vật lý (mỗi ổ: loại + dung lượng). Máy nhiều ổ (HDD + SSD) sẽ liệt kê đủ,
+    thay vì chỉ ổ đầu tiên như trước."""
+    o_cung = []
+    if USE_MODERN_CMDLETS:
+        data = run_ps("Get-PhysicalDisk | Select-Object MediaType, Size, FriendlyName")
+        if isinstance(data, dict):
+            data = [data]
+        for d in data or []:
+            if not isinstance(d, dict):
+                continue
+            mt = d.get("MediaType")
+            loai = _MEDIA_MAP.get(mt, str(mt)) if isinstance(mt, int) else str(mt or "").strip()
+            o_cung.append({"loai": loai or "Không xác định", "size": d.get("Size") or 0})
+    if not o_cung:
+        # Dự phòng (Win7 hoặc Get-PhysicalDisk không có): Win32_DiskDrive
+        data = run_ps("Get-WmiObject Win32_DiskDrive | Select-Object Model, InterfaceType, MediaType, Size")
+        if isinstance(data, dict):
+            data = [data]
+        for d in data or []:
+            if not isinstance(d, dict):
+                continue
+            model = str(d.get("Model") or "")
+            it = str(d.get("InterfaceType") or "").strip()
+            # Đoán SSD/HDD từ tên model nếu có (không có MediaType tin cậy trên WMI cũ)
+            loai = "SSD" if re.search(r"ssd|nvme|solid", model, re.I) else (it if it and it.upper() != "UNKNOWN" else "Không xác định")
+            o_cung.append({"loai": loai, "size": d.get("Size") or 0})
+    return o_cung
+
+
 def get_hardware_config():
     if USE_MODERN_CMDLETS:
         cmd = ("$cpu = Get-CimInstance Win32_Processor | Select-Object -First 1 -ExpandProperty Name; "
                "$ram = (Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory; "
-               "$disk = Get-PhysicalDisk | Select-Object -First 1 MediaType, Size; "
-               "[PSCustomObject]@{cpu=$cpu; ram=$ram; disk=$disk}")
+               "[PSCustomObject]@{cpu=$cpu; ram=$ram}")
     else:
         cmd = ("$cpu = Get-WmiObject Win32_Processor | Select-Object -First 1 -ExpandProperty Name; "
                "$ram = (Get-WmiObject Win32_ComputerSystem).TotalPhysicalMemory; "
-               "$disk = Get-WmiObject Win32_DiskDrive | Select-Object -First 1 InterfaceType, MediaType, Size; "
-               "[PSCustomObject]@{cpu=$cpu; ram=$ram; disk=$disk}")
+               "[PSCustomObject]@{cpu=$cpu; ram=$ram}")
     data = run_ps(cmd)
     if not isinstance(data, dict):
         data = {}
@@ -571,25 +647,19 @@ def get_hardware_config():
     except (TypeError, ValueError):
         ram_gb = "?"
 
-    disk = data.get("disk") or {}
-    if isinstance(disk, list):
-        disk = disk[0] if disk else {}
-    _media_map = {0: "Chưa xác định", 3: "HDD (cơ học)", 4: "SSD", 5: "SCM (Optane)"}
-    if USE_MODERN_CMDLETS:
-        mt = disk.get("MediaType")
-        if isinstance(mt, int):
-            loai_o_cung = _media_map.get(mt, f"Loại {mt}")
-        else:
-            loai_o_cung = str(mt or "Không xác định")
-    else:
-        it = str(disk.get("InterfaceType") or "").strip()
-        loai_o_cung = it if it and it.upper() != "UNKNOWN" else "Không xác định"
-    try:
-        dung_luong = f"{round(float(disk.get('Size', 0)) / (1024**3), 1)} GB"
-    except (TypeError, ValueError):
-        dung_luong = "Không xác định"
+    o_cung = _lay_danh_sach_o_cung()
+    mo_ta_o = []
+    for o in o_cung:
+        dl = _fmt_size_gb(o["size"])
+        mo_ta_o.append(f"{o['loai']} {dl}".strip() if dl != "Không xác định" else o["loai"])
+    o_cung_text = "; ".join(mo_ta_o) if mo_ta_o else "Không xác định"
 
-    return {"cpu": cpu, "ram_gb": ram_gb, "loai_o_cung": loai_o_cung, "dung_luong_o_cung": dung_luong}
+    # Giữ 2 trường cũ (ổ đầu tiên) để tương thích, thêm o_cung_text liệt kê đủ mọi ổ
+    loai_o_cung = o_cung[0]["loai"] if o_cung else "Không xác định"
+    dung_luong = _fmt_size_gb(o_cung[0]["size"]) if o_cung else "Không xác định"
+
+    return {"cpu": cpu, "ram_gb": ram_gb, "loai_o_cung": loai_o_cung,
+            "dung_luong_o_cung": dung_luong, "o_cung_text": o_cung_text, "so_o_cung": len(o_cung)}
 
 def get_antivirus_name():
     if USE_MODERN_CMDLETS:
@@ -765,6 +835,26 @@ def get_disk_devices():
         })
     return disks
 
+def _phan_loai_thiet_bi_luu_tru(ten, size_bytes):
+    """Phân loại thiết bị lưu trữ ngoài cho rõ: USB, ổ cứng gắn ngoài, điện thoại/thẻ nhớ.
+    Ưu tiên đoán theo tên thiết bị, sau đó theo dung lượng (>= 400GB thường là ổ cứng gắn ngoài)."""
+    t = (ten or "").lower()
+    if any(k in t for k in ("phone", "iphone", "android", "galaxy", "xiaomi", "oppo", "mobile")):
+        return "Điện thoại (chế độ lưu trữ)"
+    if any(k in t for k in ("ssd", "hdd", "external", "portable", "elements", "my passport",
+                            "expansion", "extreme", "one touch", "seagate", "toshiba canvio")):
+        return "Ổ cứng gắn ngoài (USB)"
+    if any(k in t for k in ("sd card", "sdhc", "sdxc", "card reader", "mmc")):
+        return "Thẻ nhớ / Đầu đọc thẻ"
+    try:
+        gb = float(size_bytes) / (1024 ** 3)
+        if gb >= 400:
+            return "Ổ cứng gắn ngoài (USB)"
+    except (TypeError, ValueError):
+        pass
+    return "USB (thiết bị lưu trữ)"
+
+
 def get_peripheral_history():
     """Quét LỊCH SỬ KẾT NỐI THIẾT BỊ NGOÀI (chỉ thiết bị ngoại vi):
     USB lưu trữ, máy in USB, điện thoại/thiết bị di động và thiết bị USB khác
@@ -832,7 +922,7 @@ def get_peripheral_history():
                         disk = disk_by_serial.get(_normalize_serial(serial_clean))
                         capacity = _fmt_size_gb(disk["size"]) if disk else "Không xác định"
                         items.append({
-                            "loai": "Thiết bị lưu trữ ngoài (USB / Ổ cứng / Điện thoại)",
+                            "loai": _phan_loai_thiet_bi_luu_tru(friendly, disk["size"] if disk else 0),
                             "ten": friendly,
                             "serial": serial_clean,
                             "dung_luong": capacity,
@@ -953,11 +1043,13 @@ def get_peripheral_history():
     except Exception:
         pass
 
-    # Khử trùng (loại + tên + seri)
+    # Khử trùng: ưu tiên theo SỐ SERI (một thiết bị vật lý dù ghi nhận nhiều lần chỉ hiện 1 lần);
+    # nếu không có seri thì theo (loại + tên).
     seen = set()
     unique_items = []
     for it in items:
-        key = (it["loai"], it["ten"], it["serial"])
+        s = _normalize_serial(it.get("serial"))
+        key = ("sn", s) if s else ("nt", it["loai"], it["ten"])
         if key not in seen:
             seen.add(key)
             unique_items.append(it)
@@ -1323,6 +1415,39 @@ def append_inline_text(para, lines):
     r = para.add_run(text)
     r.font.name = "Times New Roman"
 
+
+def _co_chu_heading(para):
+    """Lấy cỡ chữ của đoạn tiêu đề để các dòng kết quả có cùng cỡ (mặc định 13pt)."""
+    for r in para.runs:
+        if r.font.size:
+            return r.font.size
+    return docx.shared.Pt(13)
+
+
+def append_lines_as_paragraphs(after_para, lines, indent_cm=1.27):
+    """Chèn MỖI dòng kết quả thành MỘT đoạn văn riêng ngay sau đoạn tiêu đề, cùng định dạng
+    (Times New Roman, cùng cỡ chữ, thụt đầu dòng 1,27cm) để toàn văn bản đồng nhất - thay cho cách
+    cũ dùng ngắt dòng mềm khiến các dòng sau không được thụt đầu dòng."""
+    from docx.oxml import OxmlElement
+    from docx.text.paragraph import Paragraph
+    if not lines:
+        return after_para
+    co_chu = _co_chu_heading(after_para)
+    cursor = after_para
+    for line in lines:
+        new_p = OxmlElement("w:p")
+        cursor._p.addnext(new_p)
+        para = Paragraph(new_p, after_para._parent)
+        run = para.add_run(str(line))
+        run.font.name = "Times New Roman"
+        run.font.size = co_chu
+        pf = para.paragraph_format
+        pf.first_line_indent = docx.shared.Cm(indent_cm)
+        pf.space_before = docx.shared.Pt(0)
+        pf.space_after = docx.shared.Pt(0)
+        cursor = para
+    return cursor
+
 def set_table_cell_text(cell, text):
     merge_para_runs(cell.paragraphs[0])
     if cell.paragraphs[0].runs:
@@ -1370,12 +1495,54 @@ def _password_status_legacy(username):
         pass
     return None
 
+def _thu_dang_nhap_mat_khau_rong(username):
+    """Thử đăng nhập cục bộ với mật khẩu RỖNG bằng API LogonUser.
+    Trả về:
+      True  -> đăng nhập rỗng THÀNH CÔNG => tài khoản KHÔNG có mật khẩu
+      False -> bị từ chối vì sai mật khẩu  => tài khoản CÓ mật khẩu
+      None  -> không kết luận được (tài khoản Microsoft/miền, chính sách chặn, lỗi API)
+    Đây là cách đáng tin nhất để biết một tài khoản có đặt mật khẩu hay không, vì cờ
+    'PasswordRequired' của Windows vẫn = False ngay cả khi tài khoản ĐÃ đặt mật khẩu."""
+    if not IS_WINDOWS:
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        LOGON32_LOGON_INTERACTIVE = 2
+        LOGON32_PROVIDER_DEFAULT = 0
+        advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        advapi32.LogonUserW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.LPCWSTR,
+                                        wintypes.DWORD, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+        advapi32.LogonUserW.restype = wintypes.BOOL
+        token = wintypes.HANDLE()
+        ok = advapi32.LogonUserW(username, ".", "", LOGON32_LOGON_INTERACTIVE,
+                                 LOGON32_PROVIDER_DEFAULT, ctypes.byref(token))
+        if ok:
+            if token:
+                kernel32.CloseHandle(token)
+            return True  # đăng nhập với mật khẩu rỗng OK -> không có mật khẩu
+        err = ctypes.get_last_error()
+        # 1326 = ERROR_LOGON_FAILURE (sai mật khẩu -> tài khoản CÓ mật khẩu)
+        # 1327 = ERROR_ACCOUNT_RESTRICTION (thường do "không cho phép mật khẩu rỗng" -> coi như có mật khẩu)
+        if err in (1326, 1327):
+            return False
+        return None  # 1385/1327 khác, tài khoản MSA/miền... -> không kết luận
+    except Exception:
+        return None
+
+
 def get_password_status():
     """Trả True nếu tài khoản hiện tại CÓ mật khẩu, False nếu KHÔNG, None nếu không xác định."""
     try:
         username = os.environ.get("USERNAME", "")
         if not username:
             return None
+        # 1) Cách chính xác nhất: thử đăng nhập mật khẩu rỗng (xử lý được cả tài khoản Microsoft)
+        thu = _thu_dang_nhap_mat_khau_rong(username)
+        if thu is not None:
+            return not thu  # rỗng-OK => không mk; rỗng-bị-chặn => có mk
+        # 2) Dự phòng: cờ PasswordRequired (kém tin cậy nhưng còn hơn không)
         if USE_LOCALUSER:
             data = run_ps(f"Get-LocalUser -Name '{username}' -ErrorAction SilentlyContinue | "
                           "Select-Object -ExpandProperty PasswordRequired")
@@ -1637,12 +1804,15 @@ def fill_form(template_path, output_path, malware_file, vuln_file, manual_data=N
 
     hw_text = f"CPU: {hw.get('cpu', 'Không xác định')}\n" \
               f"RAM: {hw.get('ram_gb', '?')} GB\n" \
-              f"Ổ cứng loại: {hw.get('loai_o_cung', 'Không xác định')}\n" \
-              f"Dung lượng: {hw.get('dung_luong_o_cung', 'Không xác định')}"
+              f"Ổ cứng: {hw.get('o_cung_text') or hw.get('loai_o_cung', 'Không xác định')}"
     set_table_cell_text(table.rows[5].cells[1], hw_text)
     
     set_table_cell_text(table.rows[6].cells[1], av_name)
-    set_table_cell_text(table.rows[7].cells[1], top_apps)
+    office_lic = get_office_license()
+    phan_mem_text = top_apps
+    if office_lic:
+        phan_mem_text = f"{top_apps}\nBản quyền Office: {office_lic}"
+    set_table_cell_text(table.rows[7].cells[1], phan_mem_text)
     
     conn_type = get_connection_type() if online_now else ""
     set_table_cell_text(table.rows[8].cells[1], f"Kết nối Internet: {'Có' + conn_type if online_now else 'Không'}.")
@@ -1672,31 +1842,37 @@ def fill_form(template_path, output_path, malware_file, vuln_file, manual_data=N
     if online_now:
         tick_checkbox_nth(p13, 2)
 
-    for para in doc.paragraphs:
-        txt = para.text.strip().lower()
-        if txt.startswith("- tình trạng thiết bị tại thời điểm kiểm tra (tem"):
-            append_lines_to_para(para, [device_status])
-        elif txt.startswith("- lỗ hổng bảo mật hệ điều hành"):
-            append_lines_to_para(para, vuln_lines)
-        elif txt.startswith("- mã độc"):
-            append_lines_to_para(para, malware_lines)
-        elif txt.startswith("- lịch sử kết nối các thiết bị ngoại vi"):
-            append_lines_to_para(para, peripheral_lines)
-        elif txt.startswith("- lịch sử kết nối internet"):
-            append_inline_text(para, internet_history)
-        elif txt.startswith("- các nội dung khác"):
-            ghi_chu = []
-            ngay_cve = doc_ngay_du_lieu(vuln_file)
-            ngay_ioc = doc_ngay_du_lieu(malware_file)
-            if ngay_cve or ngay_ioc:
-                ghi_chu.append(f"Đối chiếu bằng bộ dữ liệu cập nhật: lỗ hổng đến {ngay_cve or 'không rõ'}; "
-                               f"mã độc đến {ngay_ioc or 'không rõ'}.")
-            if not is_admin():
-                ghi_chu.append("Công cụ chưa chạy với quyền Administrator nên một số dữ liệu có thể chưa đầy đủ.")
-            if ghi_chu:
-                append_lines_to_para(para, ghi_chu)
+    ghi_chu = []
+    ngay_cve = doc_ngay_du_lieu(vuln_file)
+    ngay_ioc = doc_ngay_du_lieu(malware_file)
+    if ngay_cve or ngay_ioc:
+        ghi_chu.append(f"Đối chiếu bằng bộ dữ liệu cập nhật: lỗ hổng đến {ngay_cve or 'không rõ'}; "
+                       f"mã độc đến {ngay_ioc or 'không rõ'}.")
+    if not is_admin():
+        ghi_chu.append("Công cụ chưa chạy với quyền Administrator nên một số dữ liệu có thể chưa đầy đủ.")
 
-    # Thụt đầu dòng 1cm cho toàn bộ đoạn văn ngoài bảng (đồng bộ với văn bản thân biên bản)
+    # Chỉ điền kết quả cho MỤC II.1 (đối với máy vi tính) - lấy lần khớp ĐẦU TIÊN của mỗi mục.
+    # Mục II.2 (thiết bị khác) để TRỐNG vì công cụ chỉ kiểm tra trực tiếp trên máy tính.
+    # Mỗi kết quả được ghi thành 1 đoạn văn riêng, thụt đầu dòng đồng nhất (xử lý ở vòng dưới).
+    da_dien = set()
+    for para in list(doc.paragraphs):  # chụp danh sách trước vì sẽ chèn thêm đoạn văn
+        txt = para.text.strip().lower()
+        if txt.startswith("- tình trạng thiết bị tại thời điểm kiểm tra (tem") and "tt" not in da_dien:
+            da_dien.add("tt"); append_lines_as_paragraphs(para, [device_status])
+        elif txt.startswith("- lỗ hổng bảo mật hệ điều hành") and "lh" not in da_dien:
+            da_dien.add("lh"); append_lines_as_paragraphs(para, vuln_lines)
+        elif txt.startswith("- mã độc") and "md" not in da_dien:
+            da_dien.add("md"); append_lines_as_paragraphs(para, malware_lines)
+        elif txt.startswith("- lịch sử kết nối các thiết bị ngoại vi") and "usb" not in da_dien:
+            da_dien.add("usb"); append_lines_as_paragraphs(para, peripheral_lines)
+        elif txt.startswith("- lịch sử kết nối internet") and "net" not in da_dien:
+            da_dien.add("net"); append_inline_text(para, internet_history)
+        elif txt.startswith("- các nội dung khác") and "khac" not in da_dien:
+            da_dien.add("khac")
+            if ghi_chu:
+                append_lines_as_paragraphs(para, ghi_chu)
+
+    # Thụt đầu dòng 1,27cm cho toàn bộ đoạn văn ngoài bảng (đồng bộ toàn văn bản)
     for para in doc.paragraphs:
         if not para.text.strip():
             continue
@@ -1704,7 +1880,7 @@ def fill_form(template_path, output_path, malware_file, vuln_file, manual_data=N
             align = para.paragraph_format.alignment
             if align in (WD_ALIGN_PARAGRAPH.CENTER, WD_ALIGN_PARAGRAPH.RIGHT):
                 continue
-            para.paragraph_format.first_line_indent = docx.shared.Cm(1)
+            para.paragraph_format.first_line_indent = docx.shared.Cm(1.27)
         except Exception:
             pass
 

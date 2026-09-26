@@ -353,17 +353,38 @@ def parse_docx_content(file_path, muc_do_cve=None):
 
     # 5. Kết quả kiểm tra (mục II.1) - lấy các dòng auto_fill ghi thêm sau tiêu đề từng mục.
     # Chỉ lấy lần khớp ĐẦU TIÊN: mục II.2 cũng có dòng "- Mã độc hoặc phần mềm độc hại...".
-    muc = {}
-    for p in paragraphs:
+    # Hỗ trợ CẢ 2 định dạng: cũ (kết quả nằm cùng đoạn tiêu đề, sau dấu xuống dòng) và mới (mỗi kết
+    # quả là 1 đoạn văn riêng ngay dưới tiêu đề) - nên gom cả hai nguồn cho đến tiêu đề mục kế tiếp.
+    muc = {}       # key -> danh sách dòng kết quả
+    muc_head = {}  # key -> text đoạn tiêu đề (dùng cho mục ghi kết quả cùng dòng, vd Internet)
+    n_par = len(paragraphs)
+    tien_to_list = (("lo_hong", "- lỗ hổng bảo mật hệ điều hành"), ("ma_doc", "- mã độc"),
+                    ("usb", "- lịch sử kết nối các thiết bị ngoại vi"),
+                    ("internet", "- lịch sử kết nối internet"))
+    for i, p in enumerate(paragraphs):
         dau = p.text.strip().lower()
-        for key, tien_to in (("lo_hong", "- lỗ hổng bảo mật hệ điều hành"), ("ma_doc", "- mã độc"),
-                             ("usb", "- lịch sử kết nối các thiết bị ngoại vi"),
-                             ("internet", "- lịch sử kết nối internet")):
+        for key, tien_to in tien_to_list:
             if dau.startswith(tien_to) and key not in muc:
-                muc[key] = p.text
+                lines = _noi_dung_sau_tieu_de(p.text)  # định dạng cũ (ngắt dòng mềm)
+                for j in range(i + 1, n_par):          # định dạng mới (đoạn văn riêng)
+                    t = paragraphs[j].text.strip()
+                    if not t:
+                        continue
+                    tl = t.lower()
+                    # Dừng ở tiêu đề mục kế tiếp. KHÔNG dùng số thứ tự chung vì dòng kết quả cũng
+                    # đánh số ("1. WannaCry...", "1. Loại: USB..."). Chỉ dừng ở bullet "-", mục lớn
+                    # (I./II./III.), mục "2. Đối với thiết bị khác..." và các đoạn kết.
+                    if t.startswith("-") or re.match(r"^\d+\.\s*đối với", tl) \
+                            or re.match(r"^(i{1,3})\.", tl) \
+                            or tl.startswith(("sau khi tiến hành", "kết thúc quá trình",
+                                              "biên bản kết thúc")):
+                        break
+                    lines.append(t)
+                muc[key] = lines
+                muc_head[key] = p.text
 
     # 5a. Lỗ hổng
-    dong_lo_hong = _noi_dung_sau_tieu_de(muc.get("lo_hong", ""))
+    dong_lo_hong = muc.get("lo_hong", [])
     noi_dung_lo_hong = " ".join(dong_lo_hong)
     vuln_m = re.search(r"Phát hiện\s+(\d+)\s+lỗ hổng[^\(]*\((.*?)\)", noi_dung_lo_hong, re.I | re.DOTALL)
     if vuln_m:
@@ -379,7 +400,7 @@ def parse_docx_content(file_path, muc_do_cve=None):
                                  if v in CRITICAL_VULNS_DICT or muc_do_cve.get(v) == "CRITICAL"]
 
     # 5b. Mã độc: "1. <Họ mã độc>: <dấu hiệu>; ..." hoặc "Không phát hiện dấu hiệu (IOC)..."
-    dong_ma_doc = _noi_dung_sau_tieu_de(muc.get("ma_doc", ""))
+    dong_ma_doc = muc.get("ma_doc", [])
     phat_hien = [re.sub(r"^\d+\.\s*", "", d) for d in dong_ma_doc if re.match(r"^\d+\.\s*\S", d)]
     if phat_hien:
         data["Ma_Doc"] = "PHÁT HIỆN: " + " | ".join(phat_hien)
@@ -390,7 +411,7 @@ def parse_docx_content(file_path, muc_do_cve=None):
         data["Ma_Doc"] = "Chưa kiểm tra (thiếu file IOC)"
 
     # 5c. Thiết bị ngoại vi / USB - mỗi dòng "N. Loại: .. | Seri: .. | Dung lượng: .. | Tên: .."
-    for d in _noi_dung_sau_tieu_de(muc.get("usb", "")):
+    for d in muc.get("usb", []):
         m = re.match(r"^\d+\.\s*Loại:\s*(.*?)\s*\|\s*Seri:\s*(.*?)\s*\|\s*Dung lượng:\s*(.*?)\s*\|\s*Tên:\s*(.+)$", d)
         if m:
             data["Lich_Su_USB"].append(f"{m.group(4).strip()} [{m.group(1).strip()}, {m.group(3).strip()}] "
@@ -399,11 +420,13 @@ def parse_docx_content(file_path, muc_do_cve=None):
         elif re.match(r"^\.\.\.\s*và\s+\d+", d):
             data["Lich_Su_USB"].append(d)
 
-    # 5d. Lịch sử Internet (ghi cùng dòng với tiêu đề mục)
-    if muc.get("internet"):
-        m = re.search(r"\(liệt kê chi tiết nếu có\):\s*(.+)$", muc["internet"], re.I | re.S)
+    # 5d. Lịch sử Internet (ghi cùng dòng với tiêu đề mục, hoặc đoạn văn ngay dưới)
+    if muc_head.get("internet"):
+        m = re.search(r"\(liệt kê chi tiết nếu có\):\s*(.+)$", muc_head["internet"], re.I | re.S)
         if m and m.group(1).strip():
             data["Lich_Su_Internet"] = m.group(1).strip()
+        elif muc.get("internet"):
+            data["Lich_Su_Internet"] = " ".join(muc["internet"]).strip()
 
     danh_gia_rui_ro(data, muc_do_cve)
     return data
