@@ -226,9 +226,17 @@ Giai đoạn 4 và 5 tiếp theo (lịch sử qua các đợt, danh mục tài s
 4. **Tải IOC**: nhập Auth-Key, đặt độ tin cậy ≥ 75% và mốc loại IP cũ → "Tải IOC" → xem lại → "Lưu".
 5. Bấm **Build**. Công cụ tự kiểm tra dữ liệu; nếu có lỗi sẽ dừng và báo. Build xong sinh `auto_fill_bien_ban.exe` + `manifest.json`.
 6. Chép cả thư mục xuất (exe + manifest.json) sang USB, mang đi kiểm tra.
-7. Trên mỗi máy: chạy exe (nên "Run as administrator"), thanh trạng thái hiển thị ngày dữ liệu để xác nhận là bản mới.
+7. **Khai báo thông tin đợt kiểm tra MỘT LẦN:** mở công cụ kiểm tra ở thư mục gốc, nhập địa điểm (tên trường),
+   tên 2 cán bộ kiểm tra, chức vụ, tên cán bộ quản lý → bấm **"💾 Lưu thông tin đợt kiểm tra"** (ghi ra `kiemtra_config.json`).
+8. **Copy CẢ THƯ MỤC** (đã có `kiemtra_config.json`) sang từng máy. Mỗi máy mở lên đã điền sẵn các thông tin này,
+   giờ/ngày tự lấy theo thời điểm chạy — chỉ cần tích tem (nếu có), chọn cung cấp mật khẩu, rồi bấm **"XÁC NHẬN"**.
+9. Trên mỗi máy: nên "Run as administrator"; thanh trạng thái hiển thị ngày dữ liệu để xác nhận là bản mới.
    Mỗi máy sinh ra biên bản `.docx` **và file kèm `.attt.json`** (chữ ký toàn vẹn) — **thu về cả hai file, giữ cạnh nhau**.
-8. Thu biên bản về, dùng tab 1/2 của công cụ TỔNG HỢP để phân tích, kiểm tra cột "Toàn Vẹn" và xuất Excel.
+10. Thu biên bản về, dùng tab 1/2 của công cụ TỔNG HỢP để phân tích, kiểm tra cột "Toàn Vẹn" và xuất Excel.
+
+> Mẹo cho buổi kiểm tra nhiều máy (vd 50 máy ở trường học, 1 người quản lý, 2 cán bộ kiểm tra): nhờ bước 7-8,
+> thông tin cố định chỉ nhập 1 lần; trên từng máy thao tác chỉ còn vài giây (tích tem + bấm Xác nhận).
+> Ô "Tên cán bộ kiểm tra" ghi được cả 2 người (vd "Nguyễn Văn A, Trần Văn B").
 
 > Lưu ý pháp lý: biên bản sẽ tự ghi "đối chiếu bằng bộ dữ liệu cập nhật đến ngày …". `manifest.json` lưu lại
 > phiên bản công cụ + mã băm để đối chứng đợt kiểm tra đã dùng bộ dữ liệu nào.

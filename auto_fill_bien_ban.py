@@ -2257,11 +2257,37 @@ MANUAL_FIELDS_DEF = [
     ("ngay", "Ngày (VD: 18)"),
     ("thang", "Tháng (VD: 07)"),
     ("nam", "Năm (VD: 2026)"),
-    ("dia_diem", "Địa điểm (VD: Trụ sở CAX Tri Phú)"),
-    ("ten_can_bo", "Tên cán bộ kiểm tra"),
+    ("dia_diem", "Địa điểm (VD: Trường THCS ...)"),
+    ("ten_can_bo", "Tên cán bộ kiểm tra (có thể ghi 2 người)"),
     ("chuc_vu", "Chức vụ cán bộ kiểm tra"),
     ("ten_doi_tuong", "Tên người/đơn vị (đồng chí)"),
 ]
+
+# Các trường CỐ ĐỊNH trong 1 buổi kiểm tra (địa điểm, cán bộ kiểm tra, chức vụ, người quản lý) - lưu lại
+# để không phải nhập đi nhập lại trên từng máy. Riêng giờ/phút/ngày để tự lấy theo thời điểm chạy.
+PERSIST_KEYS = ("dia_diem", "ten_can_bo", "chuc_vu", "ten_doi_tuong", "cung_cap_mk", "nguoi_duoc_cap")
+
+
+def _kt_config_path():
+    """File nhớ thông tin buổi kiểm tra - đặt CẠNH công cụ (đi theo khi copy cả thư mục sang máy khác)."""
+    return os.path.join(output_dir(), "kiemtra_config.json")
+
+
+def load_kt_config():
+    try:
+        with open(_kt_config_path(), "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_kt_config(cfg):
+    try:
+        with open(_kt_config_path(), "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception:
+        return False
 
 def open_result(path):
     if not IS_WINDOWS or not path:
@@ -2286,7 +2312,7 @@ def run_gui_app(template_path, output_path, malware_file, vuln_file):
     
     root = tk.Tk()
     root.title(f"{APP_NAME} v{APP_VERSION} - CAX Tri Phú")
-    root.geometry("640x780")
+    root.geometry("640x900")
     root.resizable(False, False)
     root.configure(bg="#f1f5f9")
 
@@ -2356,6 +2382,10 @@ def run_gui_app(template_path, output_path, malware_file, vuln_file):
         "nam": now.strftime("%Y")
     }
 
+    # Nạp thông tin buổi kiểm tra đã lưu (địa điểm, cán bộ, người quản lý...) để điền sẵn -> không phải
+    # gõ lại trên từng máy. Điền 1 lần, bấm "Lưu thông tin đợt kiểm tra", rồi copy cả thư mục sang máy khác.
+    kt_cfg = load_kt_config()
+
     form_frame = ttk.LabelFrame(root, text="Thông tin kiểm tra", padding=(20, 15))
     form_frame.pack(fill="x", padx=25, pady=(18, 5))
 
@@ -2365,7 +2395,9 @@ def run_gui_app(template_path, output_path, malware_file, vuln_file):
         ent = ttk.Entry(form_frame, width=42, font=("Segoe UI", 10))
         ent.grid(row=i, column=1, sticky="ew", padx=15, pady=5)
         if key in default_time:
-            ent.insert(0, default_time[key])
+            ent.insert(0, default_time[key])       # giờ/ngày: theo thời điểm chạy
+        elif kt_cfg.get(key):
+            ent.insert(0, kt_cfg[key])              # địa điểm/cán bộ: nhớ từ lần trước
         _bind_auto_cap(ent)
         entries[key] = ent
 
@@ -2373,7 +2405,7 @@ def run_gui_app(template_path, output_path, malware_file, vuln_file):
     cc_row = len(MANUAL_FIELDS_DEF)
     ttk.Label(form_frame, text="Có cung cấp mật khẩu cho người khác",
               style="Field.TLabel").grid(row=cc_row, column=0, sticky="w", pady=5)
-    cung_cap_var = tk.StringVar(value="Không")
+    cung_cap_var = tk.StringVar(value=("Có" if str(kt_cfg.get("cung_cap_mk", "")).lower() == "co" else "Không"))
     cung_cap_combo = ttk.Combobox(form_frame, textvariable=cung_cap_var, values=["Không", "Có"],
                                   state="readonly", width=39, font=("Segoe UI", 10))
     cung_cap_combo.grid(row=cc_row, column=1, sticky="ew", padx=15, pady=5)
@@ -2382,6 +2414,8 @@ def run_gui_app(template_path, output_path, malware_file, vuln_file):
               style="Field.TLabel").grid(row=cc_row + 1, column=0, sticky="w", pady=5)
     nguoi_cap_ent = ttk.Entry(form_frame, width=42, font=("Segoe UI", 10))
     nguoi_cap_ent.grid(row=cc_row + 1, column=1, sticky="ew", padx=15, pady=5)
+    if kt_cfg.get("nguoi_duoc_cap"):
+        nguoi_cap_ent.insert(0, kt_cfg["nguoi_duoc_cap"])
     _bind_auto_cap(nguoi_cap_ent)
 
     # Ô tích thủ công: máy có dán tem kiểm tra an ninh, an toàn hay không (nhìn bằng mắt thường)
@@ -2431,7 +2465,31 @@ def run_gui_app(template_path, output_path, malware_file, vuln_file):
                             bg="#2563eb", fg="white", activebackground="#1d4ed8", activeforeground="white",
                             font=("Segoe UI", 12, "bold"), borderwidth=0, padx=18, pady=9,
                             cursor="hand2", relief="flat")
-    submit_btn.pack(pady=(14, 8))
+    submit_btn.pack(pady=(14, 4))
+
+    def _thu_thap_phien():
+        """Gom các trường CỐ ĐỊNH của buổi kiểm tra để lưu lại (không gồm giờ/ngày)."""
+        cfg = {}
+        for key in ("dia_diem", "ten_can_bo", "chuc_vu", "ten_doi_tuong"):
+            cfg[key] = auto_capitalize(entries[key].get().strip())
+        cfg["cung_cap_mk"] = "co" if cung_cap_var.get() == "Có" else "khong"
+        cfg["nguoi_duoc_cap"] = auto_capitalize(nguoi_cap_ent.get().strip())
+        return cfg
+
+    def _luu_phien():
+        if save_kt_config(_thu_thap_phien()):
+            messagebox.showinfo("Đã lưu",
+                                "Đã lưu thông tin đợt kiểm tra (địa điểm, cán bộ, người quản lý) cạnh công cụ.\n\n"
+                                "Bây giờ COPY CẢ THƯ MỤC công cụ sang từng máy - mỗi máy sẽ tự điền sẵn các thông tin "
+                                "này, chỉ cần bấm 'XÁC NHẬN VÀ BẮT ĐẦU KIỂM TRA'.")
+        else:
+            messagebox.showerror("Lỗi", "Không lưu được thông tin (kiểm tra quyền ghi thư mục).")
+
+    luu_btn = tk.Button(root, text="💾 Lưu thông tin đợt kiểm tra (để copy sang máy khác, khỏi nhập lại)",
+                        bg="#0f766e", fg="white", activebackground="#0d5f59", activeforeground="white",
+                        font=("Segoe UI", 10, "bold"), borderwidth=0, padx=12, pady=6,
+                        cursor="hand2", relief="flat", command=_luu_phien)
+    luu_btn.pack(pady=(0, 8))
 
     progress_queue = _queue.Queue()
     result_holder = {}
@@ -2545,6 +2603,8 @@ def run_gui_app(template_path, output_path, malware_file, vuln_file):
         manual_data["cung_cap_mk"] = "co" if cung_cap_var.get() == "Có" else "khong"
         manual_data["nguoi_duoc_cap"] = auto_capitalize(nguoi_cap_ent.get().strip())
         manual_data["tem"] = "co" if tem_var.get() == "Có dán tem" else "khong"
+        # Nhớ lại thông tin cố định của buổi kiểm tra cho các lần chạy sau (không gồm giờ/ngày, tem)
+        save_kt_config(_thu_thap_phien())
 
         want_admin = False
         if not is_admin():
