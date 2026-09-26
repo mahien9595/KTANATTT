@@ -69,18 +69,40 @@ python-docx **không chứa** ký tự này. Vì vậy mọi regex trên văn b�
    drive.google.com, discord…. Vì công cụ kiểm tra so khớp tên miền trong cache DNS, máy nào từng mở Google Drive cũng sẽ bị báo
    "có mã độc". Nay các tên miền dịch vụ hợp pháp phổ biến được loại trừ.
 
+## 2b. Giai đoạn 2 — ĐÃ THỰC HIỆN (nâng chất lượng dữ liệu, sửa cả 2 công cụ)
+
+Trọng tâm giai đoạn 2: dữ liệu đóng gói vào công cụ kiểm tra phải **đúng, gọn, kiểm soát được** —
+vì sai dữ liệu thì hàng trăm biên bản sai theo. Các thay đổi:
+
+**A. Dữ liệu lỗ hổng (Tab 3 — MSRC):**
+- Lấy `FixedBuild` từ MSRC và ghi vào cột "build đã vá" dạng `19045.4291;22631.3447` (theo từng dòng Windows).
+- Công cụ kiểm tra đọc thêm **UBR** (`…\CurrentVersion\UBR`) và so theo `build.UBR`. Máy cập nhật tích lũy đầy đủ
+  không còn bị báo thừa lỗ hổng chỉ vì thiếu KB cũ đã bị thay thế (đã kiểm chứng: 19045.5000 → sạch, 19045.4000 → còn cảnh báo).
+- Đối chiếu **CISA KEV** + cờ `Exploited` của MSRC, đánh dấu và cho **lọc chỉ lấy lỗ hổng đã bị khai thác thực tế**.
+- Tải **nhiều tháng một lần** (mặc định 12 tháng), tự gộp và khử trùng.
+
+**B. Dữ liệu mã độc (Tab 3 — ThreatFox):**
+- Lọc **độ tin cậy ≥ 75%** (điều chỉnh được) và **loại IOC/IP quá hạn** (mặc định > 90 ngày).
+- Chặn dữ liệu gây báo nhầm diện rộng: **IP nội bộ**, **DNS công cộng** (8.8.8.8…), **tên miền dịch vụ hợp pháp**,
+  và **kiểm tra định dạng** (SHA256 đủ 64 ký tự, IP/tên miền hợp lệ). Khử trùng ngay khi tải.
+
+**C. Kiểm tra trước khi build:** rà file mẫu docx (đúng cấu trúc auto_fill cần), file CVE/IOC (đọc được, có dữ liệu),
+`APP_VERSION`. Có lỗi nghiêm trọng thì **dừng build** kèm thông báo rõ.
+
+**D. Truy vết phiên bản dữ liệu:**
+- Ghi dòng `# DATA_VERSION: <ngày>` ở đầu file CVE/IOC mỗi khi lưu. Công cụ kiểm tra đọc và **in "ngày dữ liệu" lên biên bản**
+  (mục "Các nội dung khác") — phục vụ tính pháp lý.
+- Sau khi build, ghi kèm **`manifest.json`**: phiên bản công cụ, ngày build, ngày dữ liệu, số CVE/IOC, và SHA256 của .exe + file dữ liệu.
+
+**E. Giao diện:** công cụ tổng hợp dùng bộ style thống nhất (tab, bảng, nút, thẻ KPI); công cụ kiểm tra hiển thị
+thanh trạng thái dữ liệu (ngày CVE/IOC, số mục) và quyền Administrator ngay dưới banner.
+
 ## 3. Hạn chế còn tồn tại (chưa sửa — cần quyết định hướng đi)
 
-### 3.1. Kết quả "lỗ hổng" có thể bị thổi phồng (vấn đề phương pháp, rất quan trọng)
-Công cụ kiểm tra coi một CVE là "chưa vá" khi **không có KB nào trong danh sách** được cài. Tuy nhiên, Windows 10/11 dùng
-**bản cập nhật tích lũy** (cumulative update): một máy cập nhật đầy đủ thường *không có* các KB cũ trong `Get-HotFix`,
-vì chúng đã được thay thế. Hệ quả là máy đã vá vẫn có thể bị báo hàng chục CVE. Cột "build tối thiểu" có thể khắc phục
-nhưng đang để trống với dữ liệu tải từ MSRC. Ngoài ra, cột này chỉ so số build chính (19045), chưa so bản sửa đổi (UBR, vd `19045.4291`).
-
-→ Đề xuất:
-- **Tab 3**: lấy trường `FixedBuild` (nếu MSRC cung cấp) trong Remediations của MSRC và ghi vào cột build tối thiểu, dạng `19045.4291`.
-- **Công cụ kiểm tra**: đọc thêm UBR trong registry (`HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\UBR`) rồi so sánh
-  theo `build.UBR`. Trước khi làm, nên ghi chú trên báo cáo rằng số lỗ hổng là **kết quả sơ bộ, cần xác minh**.
+### 3.1. Lưu ý về kết quả "lỗ hổng" (đã cải thiện ở giai đoạn 2, còn điểm cần biết)
+Việc so theo `build.UBR` đã xử lý phần lớn báo động thừa. Còn hai điểm cần lưu ý khi vận hành:
+- CVE cũ (trước khi có dữ liệu FixedBuild) vẫn chỉ so theo KB nên có thể còn báo thừa — nên **tải lại nhiều tháng** để bổ sung cột build.
+- Với dòng Windows không có trong danh sách FixedBuild, công cụ giữ nguyên cảnh báo (an toàn về phía thận trọng) — kiểm tra viên xác minh thêm.
 
 ### 3.2. Biên bản .docx vừa là báo cáo, vừa là dữ liệu — dễ vỡ và dễ bị sửa
 - Chỉ cần sửa mẫu (thêm/bớt một dòng) là bộ phân tích có thể đọc sai.
@@ -127,8 +149,6 @@ Có thể xuất riêng cho từng cơ quan một thông báo khắc phục.
 ### 3.6. Khác (mức nhỏ)
 - Auth-Key ThreatFox đang lưu dạng rõ trong `tong_hop_config.json`. Nên dùng Windows Credential Manager (thư viện `keyring`)
   hoặc DPAPI.
-- File CVE/IOC nhúng vào .exe chưa ghi **ngày/phiên bản dữ liệu** lên biên bản. Nên in "Dữ liệu CVE cập nhật ngày …" để biết
-  một biên bản được kiểm tra với bộ dữ liệu cũ hay mới.
 - *(Thuộc công cụ kiểm tra, ghi lại để tham khảo)*: điều kiện `startswith("- mã độc")` trong `fill_form` khớp cả mục II.2
   "- Mã độc hoặc phần mềm độc hại…", nên kết quả quét mã độc của máy bị ghi sai sang mục thiết bị khác. Công cụ tổng hợp
   hiện chỉ lấy lần khớp đầu tiên nên không bị ảnh hưởng.
@@ -137,12 +157,26 @@ Có thể xuất riêng cho từng cơ quan một thông báo khắc phục.
 
 | Giai đoạn | Nội dung | Ghi chú |
 |---|---|---|
-| **1 – Đúng dữ liệu** | Mục 2 ở trên | **Đã thực hiện** trong lần cập nhật này |
-| **2 – Tin cậy kết quả** | 3.1 (FixedBuild/UBR), in ngày dữ liệu lên biên bản | Giảm báo động giả về lỗ hổng. Cần sửa cả 2 công cụ |
+| **1 – Đúng dữ liệu** | Mục 2 | **Đã thực hiện** |
+| **2 – Tin cậy dữ liệu** | Mục 2b (FixedBuild/UBR, KEV, lọc IOC, kiểm tra trước build, ngày dữ liệu, manifest, giao diện) | **Đã thực hiện** — sửa cả 2 công cụ |
 | **3 – Toàn vẹn biên bản** | 3.2 (JSON + HMAC/ký số, phát hiện biên bản bị sửa) | Giá trị pháp lý của kết quả. Cần sửa cả 2 công cụ |
 | **4 – Quản lý theo thời gian** | 3.3 (SQLite, so sánh đợt), 3.4 (danh mục, độ phủ, chống trùng) | Chỉ sửa công cụ tổng hợp |
 | **5 – Văn bản đầu ra** | 3.5 (báo cáo cấp trên, thông báo khắc phục từng đơn vị) | Chỉ sửa công cụ tổng hợp |
 | 6 – Mở rộng tiêu chí | Tiêu chí mới do công cụ kiểm tra thu thập: tường lửa, SMBv1, RDP, BitLocker, ngày cập nhật Windows gần nhất, tuổi bản mẫu nhận diện của Defender, tài khoản quản trị | Công cụ tổng hợp chỉ cần thêm quy tắc chấm điểm |
 
-Nên làm theo thứ tự trên. Giai đoạn 2 và 3 tác động trực tiếp đến **độ tin cậy và giá trị pháp lý** của kết luận kiểm tra,
-nên ưu tiên hơn các tính năng hiển thị.
+Giai đoạn 3 tiếp theo tác động trực tiếp đến **giá trị pháp lý** của kết luận kiểm tra, nên ưu tiên hơn các tính năng hiển thị.
+
+## 5. Quy trình chuẩn trước mỗi đợt kiểm tra (bảo đảm dữ liệu mới và tính pháp lý)
+
+1. Mở công cụ **TỔNG HỢP** → tab "3. Cập nhật dữ liệu & Build".
+2. Chọn đường dẫn file CVE, IOC, mã nguồn, mẫu docx, Python (có Nuitka), thư mục xuất (chỉ cần làm 1 lần, tự nhớ).
+3. **Tải CVE**: nhập tháng mốc, chọn số tháng (mặc định 12), bấm "Tải CVE" → xem lại → "Lưu". Tick "chỉ lỗ hổng đã bị khai thác"
+   nếu muốn danh sách gọn, đúng trọng tâm.
+4. **Tải IOC**: nhập Auth-Key, đặt độ tin cậy ≥ 75% và mốc loại IP cũ → "Tải IOC" → xem lại → "Lưu".
+5. Bấm **Build**. Công cụ tự kiểm tra dữ liệu; nếu có lỗi sẽ dừng và báo. Build xong sinh `auto_fill_bien_ban.exe` + `manifest.json`.
+6. Chép cả thư mục xuất (exe + manifest.json) sang USB, mang đi kiểm tra.
+7. Trên mỗi máy: chạy exe (nên "Run as administrator"), thanh trạng thái hiển thị ngày dữ liệu để xác nhận là bản mới.
+8. Thu biên bản .docx về, dùng tab 1/2 của công cụ TỔNG HỢP để phân tích và xuất Excel.
+
+> Lưu ý pháp lý: biên bản sẽ tự ghi "đối chiếu bằng bộ dữ liệu cập nhật đến ngày …". `manifest.json` lưu lại
+> phiên bản công cụ + mã băm để đối chứng đợt kiểm tra đã dùng bộ dữ liệu nào.

@@ -43,6 +43,76 @@ def save_config(cfg):
     except Exception:
         pass
 
+_THANG_VIET_TAT = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+
+def _danh_sach_thang_lui(thang_moc, so_thang):
+    """Từ tháng mốc (vd '2026-Sep' hoặc '2026-09') tạo danh sách N tháng gần nhất tính lùi về trước,
+    theo định dạng MSRC cần ('2026-Sep', '2026-Aug'...). Trả về [] nếu tháng mốc sai định dạng."""
+    m = re.fullmatch(r"(\d{4})-([A-Za-z]{3,}|\d{1,2})", (thang_moc or "").strip())
+    if not m:
+        return []
+    nam = int(m.group(1))
+    khoa = m.group(2)
+    if khoa.isdigit():
+        thang = int(khoa)
+    else:
+        ten = khoa[:3].capitalize()
+        if ten not in _THANG_VIET_TAT:
+            return []
+        thang = _THANG_VIET_TAT.index(ten) + 1
+    if not (1 <= thang <= 12):
+        return []
+    ket_qua = []
+    for _ in range(max(1, so_thang)):
+        ket_qua.append(f"{nam}-{_THANG_VIET_TAT[thang - 1]}")
+        thang -= 1
+        if thang == 0:
+            thang = 12
+            nam -= 1
+    return ket_qua
+
+
+def _cap_nhat_data_version(path, ngay=None):
+    """Ghi/cập nhật dòng '# DATA_VERSION: <ngày>' ở ĐẦU file dữ liệu (CVE hoặc IOC).
+    Công cụ auto_fill sẽ đọc dòng này để in 'ngày dữ liệu' lên biên bản (phục vụ tính pháp lý)."""
+    ngay = ngay or datetime.now().strftime("%d/%m/%Y")
+    dong_moi = f"# DATA_VERSION: {ngay}\n"
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            noi_dung = f.readlines()
+    except Exception:
+        noi_dung = []
+    thay = False
+    for i, dong in enumerate(noi_dung):
+        if dong.strip().startswith("# DATA_VERSION:"):
+            noi_dung[i] = dong_moi
+            thay = True
+            break
+    if not thay:
+        noi_dung.insert(0, dong_moi)
+    with open(path, "w", encoding="utf-8") as f:
+        f.writelines(noi_dung)
+
+
+def doc_ngay_du_lieu_th(path):
+    """Đọc dòng '# DATA_VERSION: <ngày>' ở đầu file dữ liệu. Trả về chuỗi ngày hoặc 'không rõ'."""
+    if not path or not os.path.exists(path):
+        return "không rõ"
+    try:
+        with open(path, encoding="utf-8") as f:
+            for _ in range(30):
+                line = f.readline()
+                if not line:
+                    break
+                m = re.search(r"#\s*DATA_VERSION:\s*(.+)$", line)
+                if m:
+                    return m.group(1).strip()
+    except Exception:
+        pass
+    return "không rõ"
+
+
 def doc_phien_ban_script(duong_dan_script):
     """Đọc số phiên bản hiện tại (APP_VERSION) trong mã nguồn auto_fill_bien_ban.py.
     Trả về chuỗi kiểu '1.6', hoặc None nếu không đọc được."""
@@ -426,10 +496,32 @@ class WorkerThread(QThread):
 #  CẬP NHẬT DỮ LIỆU (CVE Windows từ MSRC / IOC mã độc từ ThreatFox) & BUILD LẠI
 #  auto_fill_bien_ban.exe - dùng cho tab 3.
 # ============================================================
-def fetch_msrc_cve(year_month):
+def fetch_cisa_kev():
+    """Tải danh sách 'Known Exploited Vulnerabilities' (KEV) của CISA (công khai, miễn phí).
+    Đây là các lỗ hổng ĐÃ BỊ KHAI THÁC THỰC TẾ - ưu tiên số 1 khi kiểm tra. Trả về set các CVE ID.
+    Lỗi mạng chỉ trả về set rỗng (không chặn luồng CVE của MSRC)."""
+    url = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        return {(v.get("cveID") or "").strip().upper()
+                for v in data.get("vulnerabilities", []) if v.get("cveID")}
+    except Exception:
+        return set()
+
+
+def _bocs_fixed_build(chuoi):
+    """Bóc '10.0.19045.4291' -> '19045.4291' (bản dựng gốc + UBR), bỏ tiền tố '10.0.'."""
+    m = re.search(r"(\d{4,6})\.(\d{1,7})\s*$", (chuoi or "").strip())
+    return f"{m.group(1)}.{m.group(2)}" if m else None
+
+
+def fetch_msrc_cve(year_month, kev_set=None):
     """Tải + bóc tách CVE từ MSRC CVRF API (public, không cần API key) cho 1 tháng
     (vd '2026-Apr'), chỉ giữ lại CVE có liên quan Windows 10/11/Server.
-    Trả về list dict: {cve, title, severity, kbs, base_score}."""
+    Trả về list dict: {cve, title, severity, kbs, fixed_builds, base_score, exploited, kev}."""
+    kev_set = kev_set or set()
     url = f"https://api.msrc.microsoft.com/cvrf/v3.0/cvrf/{year_month}"
     req = urllib.request.Request(url, headers={"Accept": "application/json",
                                                 "User-Agent": "Mozilla/5.0"})
@@ -465,11 +557,17 @@ def fetch_msrc_cve(year_month):
             continue  # không liên quan Windows 10/11/Server -> bỏ qua (Edge/Office/Azure/...)
 
         kbs = set()
+        fixed_builds = set()
         for rem in vuln.get("Remediations", []) or []:
             mo_ta = ((rem.get("Description") or {}).get("Value") or "").strip()
             so = re.sub(r"[^0-9]", "", mo_ta)
             if len(so) >= 6:
                 kbs.add(f"KB{so}")
+            # FixedBuild: bản dựng Windows đã vá lỗ hổng này (vd '10.0.19045.4291').
+            # Chỉ giữ các dòng Windows máy ở xã có thể dùng (build gốc >= 10240 = Win10 trở lên).
+            fb = _bocs_fixed_build(rem.get("FixedBuild") or "")
+            if fb and int(fb.split(".")[0]) >= 10240:
+                fixed_builds.add(fb)
 
         base_score = None
         for cvss in vuln.get("CVSSScoreSets", []) or []:
@@ -477,17 +575,31 @@ def fetch_msrc_cve(year_month):
                 base_score = cvss["BaseScore"]
                 break
         muc_do = ""
+        exploited = cve.upper() in kev_set
         for th in vuln.get("Threats", []) or []:
-            mo_ta = ((th.get("Description") or {}).get("Value") or "").strip().lower()
-            if mo_ta in ("critical", "important", "moderate", "low"):
-                muc_do = mo_ta.upper()
-                break
+            mo_ta = ((th.get("Description") or {}).get("Value") or "").strip()
+            mo_ta_l = mo_ta.lower()
+            if mo_ta_l in ("critical", "important", "moderate", "low"):
+                muc_do = mo_ta_l.upper()
+            if "exploited:yes" in mo_ta_l.replace(" ", ""):
+                exploited = True  # MSRC ghi nhận đã bị khai thác thực tế
         if not muc_do and base_score is not None:
             muc_do = ("CRITICAL" if base_score >= 9.0 else "HIGH" if base_score >= 7.0
                       else "MEDIUM" if base_score >= 4.0 else "LOW")
 
+        # Gộp fixed_build tốt nhất cho mỗi dòng Windows (UBR nhỏ nhất đủ để coi là đã vá)
+        theo_dong = {}
+        for fb in fixed_builds:
+            goc, ubr = fb.split(".")
+            goc, ubr = int(goc), int(ubr)
+            if goc not in theo_dong or ubr < theo_dong[goc]:
+                theo_dong[goc] = ubr
+        fixed_list = [f"{g}.{u}" for g, u in sorted(theo_dong.items())]
+
         ket_qua.append({"cve": cve, "title": title, "severity": muc_do or "N/A",
-                        "kbs": sorted(kbs), "base_score": base_score})
+                        "kbs": sorted(kbs), "fixed_builds": fixed_list,
+                        "base_score": base_score, "exploited": exploited,
+                        "kev": cve.upper() in kev_set})
     return ket_qua
 
 
@@ -515,29 +627,90 @@ TEN_MIEN_HOP_PHAP = (
 )
 
 
-def quy_doi_ioc_threatfox(item):
-    """Đổi 1 IOC thô từ ThreatFox sang đúng định dạng dòng của malware_signatures.txt
-    (chỉ giữ loại tương thích: sha256/domain/ip); trả về None nếu không khớp loại nào."""
+# IP KHÔNG được đưa vào danh sách mã độc dù ThreatFox có gắn cờ: DNS công cộng và dịch vụ hợp pháp.
+# Một dòng như 'ip:8.8.8.8' sẽ khiến MỌI máy có kết nối Internet bị báo "có mã độc".
+IP_KHONG_DUNG = {
+    "8.8.8.8", "8.8.4.4", "1.1.1.1", "1.0.0.1", "9.9.9.9", "149.112.112.112",
+    "208.67.222.222", "208.67.220.220", "4.2.2.2", "4.2.2.1", "0.0.0.0",
+}
+
+
+def _ip_hop_le(ip):
+    m = re.fullmatch(r"(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})", ip or "")
+    return bool(m) and all(0 <= int(x) <= 255 for x in m.groups())
+
+
+def _ip_rieng_tu(ip):
+    """IP nội bộ/không định tuyến (LAN, loopback, link-local) - không phải máy chủ mã độc trên Internet."""
+    p = [int(x) for x in ip.split(".")]
+    return (p[0] == 10 or p[0] == 127 or (p[0] == 192 and p[1] == 168)
+            or (p[0] == 172 and 16 <= p[1] <= 31) or (p[0] == 169 and p[1] == 254)
+            or p[0] == 0 or p[0] >= 224)
+
+
+def _domain_hop_le(dom):
+    dom = (dom or "").strip().lower().strip(".")
+    if not dom or "." not in dom or len(dom) > 253 or re.fullmatch(r"[\d.]+", dom):
+        return False
+    return bool(re.fullmatch(r"[a-z0-9]([a-z0-9\-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9\-]*[a-z0-9])?)+", dom))
+
+
+def _domain_bi_cam(dom):
+    dom = dom.lower().strip(".")
+    return any(dom == d or dom.endswith("." + d) for d in TEN_MIEN_HOP_PHAP)
+
+
+def _ioc_qua_han(item, max_age_days):
+    """True nếu IOC (đặc biệt IP máy chủ điều khiển) đã quá cũ. IP C2 đổi rất nhanh nên IP cũ
+    dễ đã được cấp lại cho dịch vụ hợp pháp -> gây báo nhầm."""
+    if not max_age_days:
+        return False
+    raw = (item.get("last_seen") or item.get("first_seen") or "").strip()
+    if not raw:
+        return False
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S UTC", "%Y-%m-%d"):
+        try:
+            return (datetime.now() - datetime.strptime(raw, fmt)).days > max_age_days
+        except ValueError:
+            continue
+    return False
+
+
+def quy_doi_ioc_threatfox(item, min_confidence=75, max_age_days=90):
+    """Đổi 1 IOC thô từ ThreatFox sang đúng định dạng dòng của malware_signatures.txt và LỌC CHẤT LƯỢNG.
+    Chỉ giữ loại công cụ kiểm tra dùng được (sha256/domain/ip). Trả về None nếu bị loại vì:
+    độ tin cậy thấp, quá hạn, sai định dạng, hoặc là dữ liệu dễ gây báo nhầm (IP nội bộ, DNS công cộng,
+    tên miền dịch vụ hợp pháp)."""
+    try:
+        if int(item.get("confidence_level") or 0) < min_confidence:
+            return None
+    except (TypeError, ValueError):
+        pass
+    if _ioc_qua_han(item, max_age_days):
+        return None
+
     loai = (item.get("ioc_type") or "").lower()
     gia_tri = (item.get("ioc") or "").strip()
     if not gia_tri:
         return None
+
     if loai == "sha256_hash":
-        return f"sha256:{gia_tri}"
+        return f"sha256:{gia_tri.lower()}" if re.fullmatch(r"[0-9a-fA-F]{64}", gia_tri) else None
     if loai == "domain":
-        return f"domain:{gia_tri}"
+        dom = gia_tri.lower().strip(".")
+        return f"domain:{dom}" if _domain_hop_le(dom) and not _domain_bi_cam(dom) else None
     if loai in ("ip:port", "ip"):
-        return f"ip:{gia_tri.split(':')[0]}"
+        ip = gia_tri.split(":")[0].strip()
+        return f"ip:{ip}" if _ip_hop_le(ip) and not _ip_rieng_tu(ip) and ip not in IP_KHONG_DUNG else None
     if loai == "url":
         try:
-            ten_mien = (urllib.parse.urlparse(gia_tri).hostname or "").lower()
+            ten_mien = (urllib.parse.urlparse(gia_tri).hostname or "").lower().strip(".")
             # URL độc hại đặt trên dịch vụ hợp pháp (github, google drive, discord...) KHÔNG được
             # đổi thành IOC tên miền: công cụ kiểm tra so khớp tên miền trong cache DNS, nên sẽ báo
             # "có mã độc" oan cho mọi máy chỉ vì từng mở Google Drive/GitHub.
-            if not ten_mien or re.fullmatch(r"[\d.]+", ten_mien) or any(
-                    ten_mien == d or ten_mien.endswith("." + d) for d in TEN_MIEN_HOP_PHAP):
-                return None
-            return f"domain:{ten_mien}"
+            if _domain_hop_le(ten_mien) and not _domain_bi_cam(ten_mien):
+                return f"domain:{ten_mien}"
+            return None
         except Exception:
             return None
     return None  # md5/win_registry_key/... - chưa có chỗ tương ứng trong định dạng hiện tại
@@ -545,15 +718,41 @@ def quy_doi_ioc_threatfox(item):
 
 class CveFetchThread(QThread):
     ok = pyqtSignal(list)
+    tien_trinh = pyqtSignal(str)
     error = pyqtSignal(str)
 
-    def __init__(self, year_month):
+    def __init__(self, months, chi_da_khai_thac=False):
         super().__init__()
-        self.year_month = year_month
+        self.months = months if isinstance(months, (list, tuple)) else [months]
+        self.chi_da_khai_thac = chi_da_khai_thac
 
     def run(self):
         try:
-            self.ok.emit(fetch_msrc_cve(self.year_month))
+            self.tien_trinh.emit("Đang tải danh sách lỗ hổng đã bị khai thác (CISA KEV)...")
+            kev = fetch_cisa_kev()
+            gom = {}
+            loi = []
+            for thang in self.months:
+                self.tien_trinh.emit(f"Đang tải CVE tháng {thang} từ MSRC...")
+                try:
+                    for item in fetch_msrc_cve(thang, kev):
+                        # Trùng CVE giữa các tháng: giữ bản có nhiều fixed_build/KB hơn
+                        cu = gom.get(item["cve"])
+                        if cu is None or len(item["fixed_builds"]) > len(cu["fixed_builds"]):
+                            gom[item["cve"]] = item
+                except Exception as e:
+                    loi.append(f"{thang}: {e}")
+            ket_qua = list(gom.values())
+            if self.chi_da_khai_thac:
+                ket_qua = [c for c in ket_qua if c["exploited"] or c["kev"]]
+            # Sắp xếp: đã khai thác trước, rồi theo mức độ
+            uu_tien = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "N/A": 4}
+            ket_qua.sort(key=lambda c: (not (c["exploited"] or c["kev"]),
+                                        uu_tien.get(c["severity"], 5), c["cve"]))
+            if loi and not ket_qua:
+                self.error.emit("Không tải được tháng nào:\n" + "\n".join(loi))
+                return
+            self.ok.emit(ket_qua)
         except Exception as e:
             self.error.emit(str(e))
 
@@ -674,6 +873,7 @@ class ATTTAnalysisTool(QMainWindow):
             "CPU", "RAM", "Ổ Cứng", "Số Lỗ Hổng", "Mức Nguy Cơ", "Mã Độc", "Lịch Sử USB",
             "Mật Khẩu", "Phân Loại"
         ])
+        self.table.setAlternatingRowColors(True)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.doubleClicked.connect(self.open_selected_docx)
@@ -776,19 +976,32 @@ class ATTTAnalysisTool(QMainWindow):
         cve_group = QGroupBox("1. Cập nhật CVE Windows (nguồn: MSRC Security Update Guide)")
         cve_layout = QVBoxLayout(cve_group)
         cve_top = QHBoxLayout()
-        cve_top.addWidget(QLabel("Tháng (vd 2026-Sep):"))
+        cve_top.addWidget(QLabel("Tháng đến:"))
         self.txt_cve_thang = QLineEdit(datetime.now().strftime("%Y-%b"))
         self.txt_cve_thang.setMaximumWidth(100)
+        self.txt_cve_thang.setToolTip("Tháng mốc (vd 2026-Sep). Công cụ sẽ tải lùi về trước theo số tháng bên cạnh.")
         cve_top.addWidget(self.txt_cve_thang)
-        self.btn_cve_tai = QPushButton("🔄 Tải CVE tháng này")
+        cve_top.addWidget(QLabel("Số tháng:"))
+        self.spin_cve_so_thang = QSpinBox()
+        self.spin_cve_so_thang.setRange(1, 24)
+        self.spin_cve_so_thang.setValue(self.cfg.get("cve_so_thang", 12))
+        self.spin_cve_so_thang.setMaximumWidth(56)
+        self.spin_cve_so_thang.setToolTip("Tải bao nhiêu tháng gần nhất trong một lần (gộp và khử trùng).")
+        cve_top.addWidget(self.spin_cve_so_thang)
+        self.btn_cve_tai = QPushButton("🔄 Tải CVE")
         self.btn_cve_tai.clicked.connect(self.fetch_cve)
         cve_top.addWidget(self.btn_cve_tai)
         cve_top.addStretch()
         cve_layout.addLayout(cve_top)
 
+        self.chk_cve_chi_khai_thac = QCheckBox("Chỉ lấy lỗ hổng ĐÃ bị khai thác thực tế (MSRC/CISA KEV) - danh sách gọn, đúng trọng tâm")
+        self.chk_cve_chi_khai_thac.setChecked(self.cfg.get("cve_chi_khai_thac", False))
+        cve_layout.addWidget(self.chk_cve_chi_khai_thac)
+
         self.table_cve = QTableWidget()
-        self.table_cve.setColumnCount(4)
-        self.table_cve.setHorizontalHeaderLabels(["Chọn", "CVE", "Mức độ", "Số KB"])
+        self.table_cve.setColumnCount(5)
+        self.table_cve.setHorizontalHeaderLabels(["Chọn", "CVE", "Khai thác", "Mức độ", "KB / Build đã vá"])
+        self.table_cve.setAlternatingRowColors(True)
         self.table_cve.horizontalHeader().setStretchLastSection(True)
         cve_layout.addWidget(self.table_cve)
 
@@ -810,20 +1023,40 @@ class ATTTAnalysisTool(QMainWindow):
         self.txt_threatfox_key = QLineEdit(self.cfg.get("threatfox_auth_key", ""))
         self.txt_threatfox_key.setEchoMode(QLineEdit.EchoMode.Password)
         ioc_top.addWidget(self.txt_threatfox_key)
-        ioc_top.addWidget(QLabel("Số ngày gần đây:"))
+        ioc_top.addWidget(QLabel("Số ngày:"))
         self.spin_ioc_days = QSpinBox()
         self.spin_ioc_days.setRange(1, 30)
         self.spin_ioc_days.setValue(7)
-        self.spin_ioc_days.setMaximumWidth(60)
+        self.spin_ioc_days.setMaximumWidth(56)
         ioc_top.addWidget(self.spin_ioc_days)
-        self.btn_ioc_tai = QPushButton("🔄 Tải IOC mới")
+        self.btn_ioc_tai = QPushButton("🔄 Tải IOC")
         self.btn_ioc_tai.clicked.connect(self.fetch_ioc)
         ioc_top.addWidget(self.btn_ioc_tai)
         ioc_layout.addLayout(ioc_top)
 
+        ioc_loc = QHBoxLayout()
+        ioc_loc.addWidget(QLabel("Độ tin cậy ≥"))
+        self.spin_ioc_confidence = QSpinBox()
+        self.spin_ioc_confidence.setRange(0, 100)
+        self.spin_ioc_confidence.setValue(self.cfg.get("ioc_min_confidence", 75))
+        self.spin_ioc_confidence.setSuffix(" %")
+        self.spin_ioc_confidence.setMaximumWidth(70)
+        ioc_loc.addWidget(self.spin_ioc_confidence)
+        ioc_loc.addWidget(QLabel("Loại bỏ IP/IOC cũ hơn"))
+        self.spin_ioc_maxage = QSpinBox()
+        self.spin_ioc_maxage.setRange(0, 365)
+        self.spin_ioc_maxage.setValue(self.cfg.get("ioc_max_age", 90))
+        self.spin_ioc_maxage.setSuffix(" ngày")
+        self.spin_ioc_maxage.setMaximumWidth(90)
+        self.spin_ioc_maxage.setToolTip("0 = không lọc theo thời gian. IP máy chủ điều khiển đổi nhanh nên IP cũ dễ gây báo nhầm.")
+        ioc_loc.addWidget(self.spin_ioc_maxage)
+        ioc_loc.addStretch()
+        ioc_layout.addLayout(ioc_loc)
+
         self.table_ioc = QTableWidget()
         self.table_ioc.setColumnCount(4)
         self.table_ioc.setHorizontalHeaderLabels(["Chọn", "Họ mã độc", "Loại/Giá trị", "Ngày phát hiện"])
+        self.table_ioc.setAlternatingRowColors(True)
         self.table_ioc.horizontalHeader().setStretchLastSection(True)
         ioc_layout.addWidget(self.table_ioc)
 
@@ -917,11 +1150,21 @@ class ATTTAnalysisTool(QMainWindow):
     def fetch_cve(self):
         thang = self.txt_cve_thang.text().strip()
         if not thang:
-            QMessageBox.warning(self, "Thiếu thông tin", "Nhập tháng cần tải (vd 2026-Sep).")
+            QMessageBox.warning(self, "Thiếu thông tin", "Nhập tháng mốc cần tải (vd 2026-Sep).")
             return
+        so_thang = self.spin_cve_so_thang.value()
+        months = _danh_sach_thang_lui(thang, so_thang)
+        if not months:
+            QMessageBox.warning(self, "Sai định dạng tháng",
+                                 "Tháng mốc phải dạng 'YYYY-Mon', vd 2026-Sep hoặc 2026-09.")
+            return
+        self.cfg["cve_so_thang"] = so_thang
+        self.cfg["cve_chi_khai_thac"] = self.chk_cve_chi_khai_thac.isChecked()
+        save_config(self.cfg)
         self.btn_cve_tai.setEnabled(False)
-        self.lbl_cve_status.setText("Đang tải từ MSRC...")
-        self._cve_thread = CveFetchThread(thang)
+        self.lbl_cve_status.setText(f"Đang tải {len(months)} tháng từ MSRC...")
+        self._cve_thread = CveFetchThread(months, self.chk_cve_chi_khai_thac.isChecked())
+        self._cve_thread.tien_trinh.connect(self.lbl_cve_status.setText)
         self._cve_thread.ok.connect(self._tren_cve_tai_xong)
         self._cve_thread.error.connect(self._tren_cve_loi)
         self._cve_thread.start()
@@ -936,6 +1179,7 @@ class ATTTAnalysisTool(QMainWindow):
         self._cve_data = ket_qua
         self.table_cve.setRowCount(0)
         da_co = self._doc_cve_id_da_co()
+        so_khai_thac = 0
         for item in ket_qua:
             row = self.table_cve.rowCount()
             self.table_cve.insertRow(row)
@@ -946,10 +1190,22 @@ class ATTTAnalysisTool(QMainWindow):
             self.table_cve.setItem(row, 0, chk)
             self.table_cve.setItem(row, 1, QTableWidgetItem(item["cve"] +
                                     (" (đã có)" if item["cve"] in da_co else "")))
-            self.table_cve.setItem(row, 2, QTableWidgetItem(item["severity"]))
-            self.table_cve.setItem(row, 3, QTableWidgetItem(", ".join(item["kbs"]) or "(chưa rõ KB)"))
-        self.lbl_cve_status.setText(f"Tìm thấy {len(ket_qua)} CVE liên quan Windows 10/11/Server. "
-                                     f"Xem lại rồi bấm Lưu.")
+            da_kt = item.get("exploited") or item.get("kev")
+            if da_kt:
+                so_khai_thac += 1
+            kt_item = QTableWidgetItem("⚠ CÓ" if da_kt else "")
+            if da_kt:
+                kt_item.setForeground(QColor("#C62828"))
+                kt_item.setFont(QFont("Arial", 9, QFont.Weight.Bold))
+            self.table_cve.setItem(row, 2, kt_item)
+            self.table_cve.setItem(row, 3, QTableWidgetItem(item["severity"]))
+            build_txt = "; ".join(item.get("fixed_builds") or [])
+            kb_txt = ", ".join(item["kbs"]) or "(chưa rõ KB)"
+            self.table_cve.setItem(row, 4, QTableWidgetItem(
+                kb_txt + (f"  |  build: {build_txt}" if build_txt else "")))
+        self.lbl_cve_status.setText(
+            f"Tìm thấy {len(ket_qua)} CVE Windows (trong đó {so_khai_thac} đã bị khai thác). "
+            f"Xem lại rồi bấm Lưu.")
 
     def _doc_cve_id_da_co(self):
         duong_dan = self._duong_dan_edits["duong_dan_cve"].text().strip()
@@ -982,8 +1238,12 @@ class ATTTAnalysisTool(QMainWindow):
             if item["cve"] in da_co:
                 continue
             kb_text = ";".join(item["kbs"])
-            dong_moi.append(f"{item['cve']}|{item['title']}|{item['severity']}|{kb_text}||"
-                             f"Tự động lấy từ MSRC ngày {datetime.now().strftime('%d/%m/%Y')}")
+            build_text = ";".join(item.get("fixed_builds") or [])
+            ghi_chu = f"Tự động lấy từ MSRC ngày {datetime.now().strftime('%d/%m/%Y')}"
+            if item.get("exploited") or item.get("kev"):
+                ghi_chu = "[ĐÃ BỊ KHAI THÁC] " + ghi_chu
+            # Cột 5 = 'build tối thiểu đã vá' (dạng 19045.4291;22631.3447) để so theo build.UBR
+            dong_moi.append(f"{item['cve']}|{item['title']}|{item['severity']}|{kb_text}|{build_text}|{ghi_chu}")
         if not dong_moi:
             QMessageBox.information(self, "Không có gì để lưu",
                                      "Không có CVE mới nào được chọn (có thể đã có sẵn trong file).")
@@ -993,6 +1253,7 @@ class ATTTAnalysisTool(QMainWindow):
                 f.write(f"\n# --- Bổ sung tự động từ MSRC ngày {datetime.now().strftime('%d/%m/%Y')} ---\n")
                 for dong in dong_moi:
                     f.write(dong + "\n")
+            _cap_nhat_data_version(duong_dan)
         except Exception as e:
             QMessageBox.critical(self, "Lỗi ghi file", str(e))
             return
@@ -1007,6 +1268,8 @@ class ATTTAnalysisTool(QMainWindow):
                                  "Nhập Auth-Key ThreatFox (đăng ký miễn phí tại https://auth.abuse.ch/).")
             return
         self.cfg["threatfox_auth_key"] = key
+        self.cfg["ioc_min_confidence"] = self.spin_ioc_confidence.value()
+        self.cfg["ioc_max_age"] = self.spin_ioc_maxage.value()
         save_config(self.cfg)
         self.btn_ioc_tai.setEnabled(False)
         self.lbl_ioc_status.setText("Đang tải từ ThreatFox...")
@@ -1023,10 +1286,14 @@ class ATTTAnalysisTool(QMainWindow):
     def _tren_ioc_tai_xong(self, ket_qua_tho):
         self.btn_ioc_tai.setEnabled(True)
         da_co = self._doc_ioc_da_co()
+        min_conf = self.spin_ioc_confidence.value()
+        max_age = self.spin_ioc_maxage.value()
         self._ioc_data = []
+        da_thay = set()
         for item in ket_qua_tho:
-            dong = quy_doi_ioc_threatfox(item)
-            if dong:
+            dong = quy_doi_ioc_threatfox(item, min_conf, max_age)
+            if dong and dong not in da_thay:  # khử trùng ngay khi tải
+                da_thay.add(dong)
                 self._ioc_data.append({"dong": dong, "ho": item.get("malware_printable") or
                                         item.get("malware") or "?", "ngay": item.get("first_seen", "")})
         self.table_ioc.setRowCount(0)
@@ -1086,6 +1353,7 @@ class ATTTAnalysisTool(QMainWindow):
                     f.write(f"\n# --- {ho} ---\n")
                     for dong in dong_list:
                         f.write(dong + "\n")
+            _cap_nhat_data_version(duong_dan)
         except Exception as e:
             QMessageBox.critical(self, "Lỗi ghi file", str(e))
             return
@@ -1106,6 +1374,18 @@ class ATTTAnalysisTool(QMainWindow):
         thu_muc_xuat = self._duong_dan_edits["thu_muc_xuat"].text().strip()
 
         self.txt_build_log.clear()
+
+        # Kiểm tra dữ liệu TRƯỚC khi build - tránh mang một bản .exe hỏng đi chạy trên hàng trăm máy
+        loi, canh_bao = self._kiem_tra_truoc_build()
+        for c in canh_bao:
+            self.txt_build_log.append(f"⚠ {c}")
+        if loi:
+            self.txt_build_log.append("❌ DỪNG BUILD - lỗi nghiêm trọng:")
+            for l in loi:
+                self.txt_build_log.append(f"   • {l}")
+            QMessageBox.critical(self, "Không thể build",
+                                 "Dữ liệu chưa hợp lệ, cần sửa trước khi build:\n\n- " + "\n- ".join(loi))
+            return
 
         # Tự tăng phiên bản (vd 1.6 -> 1.7) TRƯỚC khi build, nếu được tick - để mã nguồn
         # và bản .exe xuất ra luôn khớp nhau, không phải tự sửa tay APP_VERSION mỗi lần.
@@ -1154,16 +1434,138 @@ class ATTTAnalysisTool(QMainWindow):
         cmd.append(duong_dan_script)
 
         self.txt_build_log.append("Lệnh build: " + " ".join(cmd))
+        # Lưu ngữ cảnh để ghi phiếu build (manifest) khi build xong
+        self._build_context = {
+            "thu_muc_xuat": thu_muc_xuat,
+            "phien_ban": phien_ban_hien or "?",
+            "cong_ty": ten_cong_ty,
+            "san_pham": ten_san_pham,
+        }
         self.btn_build.setEnabled(False)
         self._build_thread = BuildThread(cmd)
         self._build_thread.log_line.connect(self.txt_build_log.append)
         self._build_thread.finished_build.connect(self._tren_build_xong)
         self._build_thread.start()
 
+    def _kiem_tra_truoc_build(self):
+        """Kiểm tra file mẫu docx, file CVE, file IOC và số phiên bản trước khi build.
+        Trả về (danh_sách_lỗi_nghiêm_trọng, danh_sách_cảnh_báo)."""
+        loi, canh_bao = [], []
+        E = self._duong_dan_edits
+
+        # 1. Mã nguồn có APP_VERSION
+        script = E["duong_dan_script"].text().strip()
+        if not doc_phien_ban_script(script):
+            loi.append("Không đọc được APP_VERSION trong mã nguồn auto_fill_bien_ban.py.")
+
+        # 2. File mẫu biên bản đúng cấu trúc mà auto_fill cần (bảng ≥ 9 dòng, ≥ 14 đoạn văn)
+        docx_path = E["duong_dan_mau_docx"].text().strip()
+        try:
+            d = docx.Document(docx_path)
+            if not d.tables or len(d.tables[0].rows) < 9:
+                loi.append("File mẫu biên bản thiếu bảng thông tin (cần ≥ 9 dòng).")
+            if len(d.paragraphs) < 14:
+                loi.append("File mẫu biên bản thiếu các đoạn văn cần thiết (cần ≥ 14 đoạn).")
+        except Exception as e:
+            loi.append(f"Không mở được file mẫu biên bản: {e}")
+
+        # 3. File CVE đọc được và có ít nhất 1 dòng hợp lệ
+        cve_path = E["duong_dan_cve"].text().strip()
+        if cve_path and os.path.exists(cve_path):
+            n = 0
+            try:
+                with open(cve_path, encoding="utf-8") as f:
+                    for dong in f:
+                        dong = dong.strip()
+                        if dong and not dong.startswith("#") and len(dong.split("|")) >= 4:
+                            n += 1
+            except Exception as e:
+                loi.append(f"Không đọc được file CVE: {e}")
+            if n == 0:
+                loi.append("File CVE không có dòng lỗ hổng hợp lệ nào.")
+            else:
+                canh_bao.append(f"File CVE: {n} lỗ hổng. Dữ liệu cập nhật: {doc_ngay_du_lieu_th(cve_path)}.")
+        else:
+            canh_bao.append("Chưa chọn file CVE - biên bản sẽ bỏ qua bước đối chiếu lỗ hổng.")
+
+        # 4. File IOC đọc được và có ít nhất 1 dấu hiệu
+        ioc_path = E["duong_dan_ioc"].text().strip()
+        if ioc_path and os.path.exists(ioc_path):
+            n = 0
+            try:
+                with open(ioc_path, encoding="utf-8") as f:
+                    for dong in f:
+                        dong = dong.strip()
+                        if dong and not dong.startswith("#") and ":" in dong:
+                            n += 1
+            except Exception as e:
+                loi.append(f"Không đọc được file IOC: {e}")
+            if n == 0:
+                canh_bao.append("File IOC không có dấu hiệu nào - biên bản sẽ luôn báo 'không phát hiện mã độc'.")
+            else:
+                canh_bao.append(f"File IOC: {n} dấu hiệu. Dữ liệu cập nhật: {doc_ngay_du_lieu_th(ioc_path)}.")
+        else:
+            canh_bao.append("Chưa chọn file IOC - biên bản sẽ bỏ qua bước quét mã độc.")
+
+        return loi, canh_bao
+
+    def _ghi_manifest(self):
+        """Ghi phiếu build (manifest.json) cạnh file .exe: phiên bản, ngày build, ngày dữ liệu,
+        số CVE/IOC và mã băm SHA256 của .exe và các file dữ liệu - phục vụ truy vết/pháp lý."""
+        ctx = getattr(self, "_build_context", None)
+        if not ctx:
+            return
+        thu_muc = ctx["thu_muc_xuat"]
+        exe_path = os.path.join(thu_muc, "auto_fill_bien_ban.exe")
+        E = self._duong_dan_edits
+
+        def _sha256(path):
+            try:
+                import hashlib
+                h = hashlib.sha256()
+                with open(path, "rb") as f:
+                    for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                        h.update(chunk)
+                return h.hexdigest()
+            except Exception:
+                return None
+
+        def _dem(path, la_cve):
+            if not path or not os.path.exists(path):
+                return 0
+            n = 0
+            with open(path, encoding="utf-8") as f:
+                for dong in f:
+                    dong = dong.strip()
+                    if dong and not dong.startswith("#") and (("|" in dong) if la_cve else (":" in dong)):
+                        n += 1
+            return n
+
+        cve_path = E["duong_dan_cve"].text().strip()
+        ioc_path = E["duong_dan_ioc"].text().strip()
+        manifest = {
+            "san_pham": ctx["san_pham"],
+            "cong_ty": ctx["cong_ty"],
+            "phien_ban_cong_cu": ctx["phien_ban"],
+            "ngay_build": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+            "du_lieu_cve": {"ngay": doc_ngay_du_lieu_th(cve_path), "so_luong": _dem(cve_path, True),
+                            "sha256": _sha256(cve_path) if cve_path else None},
+            "du_lieu_ioc": {"ngay": doc_ngay_du_lieu_th(ioc_path), "so_luong": _dem(ioc_path, False),
+                            "sha256": _sha256(ioc_path) if ioc_path else None},
+            "sha256_exe": _sha256(exe_path),
+        }
+        try:
+            with open(os.path.join(thu_muc, "manifest.json"), "w", encoding="utf-8") as f:
+                json.dump(manifest, f, ensure_ascii=False, indent=2)
+            self.txt_build_log.append(f"Đã ghi phiếu build: {os.path.join(thu_muc, 'manifest.json')}")
+        except Exception as e:
+            self.txt_build_log.append(f"⚠ Không ghi được manifest.json: {e}")
+
     def _tren_build_xong(self, ok, msg):
         self.btn_build.setEnabled(True)
         if ok:
-            QMessageBox.information(self, "Build xong", msg)
+            self._ghi_manifest()
+            QMessageBox.information(self, "Build xong", msg + "\n\nĐã ghi kèm phiếu build manifest.json.")
         else:
             QMessageBox.critical(self, "Build lỗi", msg)
 
@@ -1423,9 +1825,40 @@ class ATTTAnalysisTool(QMainWindow):
         QMessageBox.information(self, "Thành công", f"Đã xuất báo cáo Excel thành công tại:\n{save_path}")
 
 
+APP_STYLESHEET = """
+QMainWindow, QWidget { background-color: #f4f6fb; color: #1f2937; font-family: 'Segoe UI'; font-size: 10pt; }
+QGroupBox { background-color: #ffffff; border: 1px solid #dbe2ef; border-radius: 10px;
+            margin-top: 14px; padding: 12px 10px 10px 10px; font-weight: bold; }
+QGroupBox::title { subcontrol-origin: margin; left: 14px; padding: 2px 8px;
+                   color: #1e3a8a; background-color: #e8efff; border-radius: 6px; }
+QTabWidget::pane { border: 1px solid #dbe2ef; border-radius: 8px; top: -1px; background: #ffffff; }
+QTabBar::tab { background: #e2e8f0; color: #334155; padding: 9px 18px; margin-right: 3px;
+               border-top-left-radius: 8px; border-top-right-radius: 8px; font-weight: bold; }
+QTabBar::tab:selected { background: #1e3a8a; color: #ffffff; }
+QTabBar::tab:hover:!selected { background: #cbd5e1; }
+QLineEdit, QSpinBox, QComboBox { background: #ffffff; border: 1px solid #cbd5e1; border-radius: 6px; padding: 5px 8px; }
+QLineEdit:focus, QSpinBox:focus, QComboBox:focus { border: 1px solid #2563eb; }
+QLineEdit:read-only { background: #f1f5f9; color: #475569; }
+QPushButton { background-color: #2563eb; color: #ffffff; border: none; border-radius: 6px;
+              padding: 7px 14px; font-weight: bold; }
+QPushButton:hover { background-color: #1d4ed8; }
+QPushButton:pressed { background-color: #1e40af; }
+QPushButton:disabled { background-color: #94a3b8; }
+QTableWidget { background: #ffffff; alternate-background-color: #f8fafc; gridline-color: #e5e7eb;
+               border: 1px solid #dbe2ef; border-radius: 8px; selection-background-color: #dbeafe;
+               selection-color: #0f172a; }
+QHeaderView::section { background-color: #1e3a8a; color: #ffffff; padding: 6px; border: none; font-weight: bold; }
+QProgressBar { border: 1px solid #cbd5e1; border-radius: 8px; text-align: center; background: #e2e8f0; height: 20px; }
+QProgressBar::chunk { background-color: #16a34a; border-radius: 7px; }
+QTextEdit { background: #ffffff; border: 1px solid #dbe2ef; border-radius: 8px; }
+QCheckBox { spacing: 6px; }
+QLabel { background: transparent; }
+"""
+
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+    app.setStyleSheet(APP_STYLESHEET)
     win = ATTTAnalysisTool()
     win.show()
     sys.exit(app.exec())

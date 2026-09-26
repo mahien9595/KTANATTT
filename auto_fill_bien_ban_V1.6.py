@@ -437,14 +437,35 @@ def get_os_info():
     else:
         license_text = "Không xác định (không đọc được trạng thái kích hoạt)"
 
+    build_number = os_info.get("BuildNumber", "")
+    ubr = _get_ubr()
+    # Số bản dựng đầy đủ dạng "19045.4291": Windows cập nhật tích lũy chỉ nâng phần UBR
+    # (sau dấu chấm), nên phải so tới UBR mới biết máy đã vá lỗ hổng gần đây hay chưa.
+    build_full = f"{build_number}.{ubr}" if (build_number and ubr is not None) else str(build_number or "")
+
     return {
         "ten_he_dieu_hanh": os_info.get("Caption", "Không xác định"),
-        "build": os_info.get("BuildNumber", ""),
+        "build": build_number,
+        "ubr": ubr,
+        "build_full": build_full,
         "ngay_cai": _fmt_wmi_date(os_info.get("InstallDate", "")),
         "ban_quyen": license_text,
-        "os_display": f'{os_info.get("Caption","Không xác định")} (Build {os_info.get("BuildNumber","?")}) '
+        "os_display": f'{os_info.get("Caption","Không xác định")} (Build {build_full or "?"}) '
                       f'- Bản quyền: {license_text}',
     }
+
+
+def _get_ubr():
+    """Đọc UBR (Update Build Revision) - phần số sau dấu chấm của bản dựng Windows 10/11,
+    vd bản dựng 19045.4291 thì UBR = 4291. Đây là phần thay đổi mỗi lần cập nhật tích lũy."""
+    if not IS_WINDOWS:
+        return None
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                            r"SOFTWARE\Microsoft\Windows NT\CurrentVersion") as k:
+            return int(winreg.QueryValueEx(k, "UBR")[0])
+    except Exception:
+        return None
 
 def _fmt_wmi_date(raw):
     if not raw:
@@ -979,21 +1000,80 @@ def parse_vuln_file(path):
                 "severity": severity.strip(),
                 "kbs": [k.strip().upper() for k in kbs.split(";") if k.strip()],
                 "min_build": min_build.strip(),
+                "fixed_builds": _parse_fixed_builds(min_build),
             })
     return entries
 
-def scan_os_vulnerabilities(vuln_file_path, os_build):
+
+def _parse_fixed_builds(raw):
+    """Bóc tách cột 'bản dựng đã vá' thành dict {bản_dựng_gốc: UBR_tối_thiểu}.
+    Hỗ trợ:
+      - '19045.4291;22631.3447'  -> {19045: 4291, 22631: 3447} (so theo từng dòng Windows)
+      - '19041'                  -> {19041: 0}  (định dạng cũ: chỉ so bản dựng gốc)
+    Nhờ tách theo từng dòng Windows (19045=22H2, 22631=23H2...) nên máy đã cập nhật tích lũy
+    KHÔNG còn bị báo thừa lỗ hổng chỉ vì thiếu các KB cũ đã bị thay thế."""
+    result = {}
+    for phan in re.split(r"[;,]", raw or ""):
+        phan = phan.strip()
+        if not phan:
+            continue
+        if "." in phan:
+            goc, _, ubr = phan.partition(".")
+            try:
+                result[int(goc)] = int(re.sub(r"[^0-9]", "", ubr) or 0)
+            except ValueError:
+                continue
+        else:
+            try:
+                result[int(phan)] = 0
+            except ValueError:
+                continue
+    return result
+
+
+def _da_va_theo_build(fixed_builds, os_build, os_ubr):
+    """Máy được coi là đã vá theo bản dựng khi bản dựng gốc khớp một dòng Windows trong danh sách
+    và UBR của máy >= UBR đã vá của dòng đó. Nếu bản dựng gốc của máy MỚI HƠN mọi mốc trong danh
+    sách (dòng Windows mới hơn) thì cũng coi như đã vá."""
+    if not fixed_builds:
+        return False
+    try:
+        b = int(os_build)
+    except (ValueError, TypeError):
+        return False
+    u = os_ubr if isinstance(os_ubr, int) else 0
+    if b in fixed_builds:
+        return u >= fixed_builds[b]
+    # Bản dựng gốc không có trong danh sách: nếu máy mới hơn mốc lớn nhất -> đã qua đợt vá đó.
+    return b > max(fixed_builds)
+
+
+def doc_ngay_du_lieu(path):
+    """Đọc dòng '# DATA_VERSION: <ngày>' mà công cụ TỔNG HỢP ghi ở đầu file CVE/IOC khi cập nhật.
+    Trả về chuỗi ngày (vd '20/09/2026') hoặc None. Dùng để in lên biên bản, phục vụ tính pháp lý:
+    biết một biên bản được kiểm tra bằng bộ dữ liệu cập nhật đến thời điểm nào."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            for _ in range(30):  # chỉ dò trong phần đầu file
+                line = f.readline()
+                if not line:
+                    break
+                m = re.search(r"#\s*DATA_VERSION:\s*(.+)$", line)
+                if m:
+                    return m.group(1).strip()
+    except Exception:
+        pass
+    return None
+
+
+def scan_os_vulnerabilities(vuln_file_path, os_build, os_ubr=None):
     installed = get_installed_hotfixes()
     entries = parse_vuln_file(vuln_file_path)
     findings = []
     for e in entries:
         patched = any(kb in installed for kb in e["kbs"])
-        if not patched and e["min_build"]:
-            try:
-                if int(os_build) >= int(e["min_build"]):
-                    patched = True
-            except (ValueError, TypeError):
-                pass
+        if not patched and _da_va_theo_build(e["fixed_builds"], os_build, os_ubr):
+            patched = True
         if not patched and e["kbs"]:
             findings.append(f'{e["cve"]} - {e["name"]} (Mức độ: {e["severity"]}) - CHƯA phát hiện bản vá')
     return findings
@@ -1141,6 +1221,19 @@ def scan_files_shallow(dirs, filename_patterns, max_depth=2):
                         matches.append(os.path.join(root, fname))
     return matches
 
+def _domain_trong_cache(domain, dns_cache):
+    """So khớp tên miền IOC với cache DNS theo dạng khớp đúng hoặc là tên miền con
+    (vd IOC 'evil.com' khớp 'a.evil.com' nhưng KHÔNG khớp 'notevil.com') - tránh báo nhầm."""
+    dom = domain.lower().strip(".")
+    if not dom:
+        return False
+    for d in dns_cache:
+        d = d.lower().strip(".")
+        if d == dom or d.endswith("." + dom):
+            return True
+    return False
+
+
 def scan_malware(malware_file_path):
     families = parse_malware_signatures(malware_file_path)
     if not families:
@@ -1177,7 +1270,7 @@ def scan_malware(malware_file_path):
             if ip in active_ips:
                 hits.append(f"kết nối mạng tới IP nghi vấn '{ip}'")
         for domain in fam["domain"]:
-            if any(domain.lower() in d for d in dns_domains):
+            if _domain_trong_cache(domain, dns_domains):
                 hits.append(f"có trong cache DNS: '{domain}'")
         if fam["sha256"]:
             for p in running:
@@ -1474,7 +1567,7 @@ def fill_form(template_path, output_path, malware_file, vuln_file, manual_data=N
     if not os.path.exists(vuln_file):
         vuln_lines = ["CẢNH BÁO: Không tìm thấy file danh sách CVE; bỏ qua bước đối chiếu lỗ hổng."]
     else:
-        vuln_findings = scan_os_vulnerabilities(vuln_file, os_info["build"])
+        vuln_findings = scan_os_vulnerabilities(vuln_file, os_info["build"], os_info.get("ubr"))
         vuln_lines = format_vuln_text(vuln_findings)
 
     step(8, "Đang đối chiếu dấu hiệu mã độc (IOC)...")
@@ -1588,6 +1681,17 @@ def fill_form(template_path, output_path, malware_file, vuln_file, manual_data=N
             append_lines_to_para(para, peripheral_lines)
         elif txt.startswith("- lịch sử kết nối internet"):
             append_inline_text(para, internet_history)
+        elif txt.startswith("- các nội dung khác"):
+            ghi_chu = []
+            ngay_cve = doc_ngay_du_lieu(vuln_file)
+            ngay_ioc = doc_ngay_du_lieu(malware_file)
+            if ngay_cve or ngay_ioc:
+                ghi_chu.append(f"Đối chiếu bằng bộ dữ liệu cập nhật: lỗ hổng đến {ngay_cve or 'không rõ'}; "
+                               f"mã độc đến {ngay_ioc or 'không rõ'}.")
+            if not is_admin():
+                ghi_chu.append("Công cụ chưa chạy với quyền Administrator nên một số dữ liệu có thể chưa đầy đủ.")
+            if ghi_chu:
+                append_lines_to_para(para, ghi_chu)
 
     # Thụt đầu dòng 1cm cho toàn bộ đoạn văn ngoài bảng (đồng bộ với văn bản thân biên bản)
     for para in doc.paragraphs:
@@ -1823,6 +1927,34 @@ def run_gui_app(template_path, output_path, malware_file, vuln_file):
              bg=PRIMARY, fg="white", font=("Segoe UI", 15, "bold")).pack(pady=(16, 0))
     tk.Label(banner, text=f"{APP_NAME} - Phiên bản v{APP_VERSION} | CAX Tri Phú",
              bg=PRIMARY, fg="#bfdbfe", font=("Segoe UI", 10)).pack(pady=(3, 0))
+
+    # Thanh trạng thái dữ liệu + quyền: cho kiểm tra viên biết bộ CVE/IOC cập nhật đến ngày nào và
+    # có đang chạy với quyền Administrator hay không TRƯỚC khi bấm kiểm tra.
+    info_bar = tk.Frame(root, bg="#e8efff")
+    info_bar.pack(fill="x")
+    ngay_cve = doc_ngay_du_lieu(vuln_file) or "không rõ"
+    ngay_ioc = doc_ngay_du_lieu(malware_file) or "không rõ"
+
+    def _dem_dong(path, la_cve):
+        try:
+            n = 0
+            with open(path, encoding="utf-8") as f:
+                for d in f:
+                    d = d.strip()
+                    if d and not d.startswith("#") and (("|" in d) if la_cve else (":" in d)):
+                        n += 1
+            return n
+        except Exception:
+            return 0
+
+    so_cve = _dem_dong(vuln_file, True)
+    so_ioc = _dem_dong(malware_file, False)
+    tk.Label(info_bar, bg="#e8efff", fg="#1e3a8a", font=("Segoe UI", 9),
+             text=f"Dữ liệu lỗ hổng: {so_cve} mục (cập nhật {ngay_cve})   •   "
+                  f"Dấu hiệu mã độc: {so_ioc} mục (cập nhật {ngay_ioc})").pack(side="left", padx=14, pady=5)
+    admin_txt = "● Quyền Administrator" if is_admin() else "● Quyền thường (nên cấp Admin)"
+    tk.Label(info_bar, bg="#e8efff", fg=("#16a34a" if is_admin() else "#b45309"),
+             font=("Segoe UI", 9, "bold"), text=admin_txt).pack(side="right", padx=14, pady=5)
 
     now = datetime.now()
     default_time = {
