@@ -25,7 +25,9 @@ from PySide6.QtGui import QFont, QColor
 
 # Nơi lưu các đường dẫn/cấu hình cho tab "Cập nhật dữ liệu & Build" - cùng thư mục với
 # chương trình đang chạy (script hoặc .exe), để không mất khi đổi máy/đổi thư mục làm việc.
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tong_hop_config.json")
+# Dùng sys.argv[0] thay vì __file__: khi build onefile (Nuitka/PyInstaller), __file__ trỏ vào
+# thư mục giải nén tạm và bị xoá sau mỗi lần thoát -> cấu hình sẽ mất.
+CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "tong_hop_config.json")
 
 def load_config():
     try:
@@ -85,15 +87,79 @@ CRITICAL_VULNS_DICT = {
     "CVE-2022-30190": "Follina (Khai thác MSDT qua Office)"
 }
 
-def parse_docx_content(file_path):
+def doc_muc_do_cve(duong_dan_cve):
+    """Đọc file windows_vulnerabilities.txt -> dict {CVE: mức độ (CRITICAL/HIGH/...)}.
+    Dùng để đánh giá rủi ro theo đúng mức độ của từng CVE thay vì chỉ đếm số lượng."""
+    ket_qua = {}
+    if not duong_dan_cve or not os.path.exists(duong_dan_cve):
+        return ket_qua
+    try:
+        with open(duong_dan_cve, "r", encoding="utf-8") as f:
+            for dong in f:
+                dong = dong.strip()
+                if not dong or dong.startswith("#"):
+                    continue
+                phan = dong.split("|")
+                if len(phan) >= 3:
+                    muc_do = phan[2].strip().upper()
+                    # MSRC dùng thang Critical/Important/Moderate/Low -> quy về cùng thang với file gốc
+                    muc_do = {"IMPORTANT": "HIGH", "MODERATE": "MEDIUM"}.get(muc_do, muc_do)
+                    ket_qua[phan[0].strip().upper()] = muc_do
+    except Exception:
+        pass
+    return ket_qua
+
+
+# Ký tự Wingdings của ô đã tích (auto_fill_bien_ban dùng F0FE; F0FC/F0FD/F078/F0FB là các kiểu
+# tích tay thường gặp khi cán bộ sửa lại biên bản trong Word). Ô trống là F0A8/F06F.
+_KY_TU_O_DA_TICH = {"F0FE", "F0FD", "F0FC", "F0FB", "F078"}
+_W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+_W14_NS = "http://schemas.microsoft.com/office/word/2010/wordml"
+
+
+def doc_o_tich(paragraph):
+    """Trả về danh sách (nhãn, đã_tích) của các ô tích trong 1 đoạn văn, theo thứ tự.
+    Nhãn là phần chữ đứng NGAY TRƯỚC ô tích (vd 'Đặt mật khẩu đăng nhập: Có [x]  không [ ]').
+    Lưu ý: paragraph.text của python-docx KHÔNG chứa ký tự ô tích (w:sym), nên không thể dùng
+    regex trên văn bản để biết ô nào được tích - phải đọc trực tiếp XML."""
+    ket_qua = []
+    nhan = ""
+    for el in paragraph._p.iter():
+        tag = el.tag
+        if tag == f"{{{_W_NS}}}t":
+            nhan += el.text or ""
+        elif tag == f"{{{_W_NS}}}tab":
+            nhan += " "
+        elif tag == f"{{{_W_NS}}}sym":
+            ky_tu = (el.get(f"{{{_W_NS}}}char") or "").upper()
+            ket_qua.append((_lam_sach_nhan(nhan), ky_tu in _KY_TU_O_DA_TICH))
+            nhan = ""
+        elif tag == f"{{{_W14_NS}}}checked":  # ô tích dạng content control (Word 2010+)
+            ket_qua.append((_lam_sach_nhan(nhan), el.get(f"{{{_W14_NS}}}val") in ("1", "true")))
+            nhan = ""
+    return ket_qua
+
+
+def _lam_sach_nhan(nhan):
+    nhan = nhan.split(":")[-1]
+    return nhan.replace("|", " ").strip()
+
+
+def _noi_dung_sau_tieu_de(paragraph_text):
+    """Kết quả do auto_fill_bien_ban ghi thêm vào sau dòng tiêu đề mục (sau dấu xuống dòng)."""
+    phan = paragraph_text.split("\n", 1)
+    return [d.strip() for d in phan[1].split("\n") if d.strip()] if len(phan) > 1 else []
+
+
+def _la_gia_tri_trong(gia_tri):
+    return not gia_tri or re.fullmatch(r"[….\s]*", gia_tri) is not None
+
+
+def parse_docx_content(file_path, muc_do_cve=None):
+    muc_do_cve = muc_do_cve or {}
     doc = docx.Document(file_path)
-    full_text = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
-    for table in doc.tables:
-        for row in table.rows:
-            row_text = [c.text.strip() for c in row.cells if c.text.strip()]
-            if row_text:
-                full_text.append(" | ".join(row_text))
-    text = "\n".join(full_text)
+    paragraphs = doc.paragraphs
+    text = "\n".join(p.text.strip() for p in paragraphs if p.text.strip())
 
     filename = os.path.basename(file_path)
     data = {
@@ -102,8 +168,10 @@ def parse_docx_content(file_path):
         "Thoi_Gian_KT": "Không rõ",
         "Dia_Diem": "Không rõ",
         "Can_Bo_KT": "Không rõ",
+        "Chuc_Vu_KT": "",
         "Can_Bo_Quan_Ly": "Không rõ",
         "Mat_Khau": "Không rõ",
+        "Cung_Cap_MK": "Không rõ",
         "Phan_Loai_May": "Không rõ",
         "Ten_May": "Không rõ",
         "He_Dieu_Hanh": "Không rõ",
@@ -115,99 +183,209 @@ def parse_docx_content(file_path):
         "Loai_OCung": "Không rõ",
         "DungLuong_OCung": "Không rõ",
         "Phan_Mem_Diet_Virus": "Không rõ",
+        "Phan_Mem_Ung_Dung": "Không rõ",
         "Ket_Noi_Mang": "Không rõ",
+        "Lich_Su_Internet": "Không rõ",
+        "Tinh_Trang_Kiem_Tra_Lo_Hong": "Không rõ",
         "So_Luong_Lo_Hong": 0,
         "Danh_Sach_Lo_Hong": [],
         "Lo_Hong_Nguy_Hiem": [],
-        "Ma_Doc": "Không phát hiện",
+        "Ma_Doc": "Không rõ",
+        "Ho_Ma_Doc": [],
         "Lich_Su_USB": [],
-        "Muc_Do_Rui_Ro": "An toàn"
+        "USB_Seri": [],
+        "Muc_Do_Rui_Ro": "An toàn",
+        "Ly_Do_Rui_Ro": [],
     }
 
     # 1. Thời gian & Địa điểm
     time_m = re.search(r"Vào hồi\s+([^,]+?),\s+ngày\s+(\d{1,2}\s+tháng\s+\d{1,2}\s+năm\s+\d{4})", text, re.I)
     if time_m:
         data["Thoi_Gian_KT"] = f"{time_m.group(1).strip()} - {time_m.group(2).strip()}"
-    loc_m = re.search(r"tại\s+([^.\n]+?)\.\s*Tổ an ninh", text, re.I)
-    if loc_m:
+    loc_m = re.search(r"Vào hồi[^\n]*?,\s*tại\s+([^\n]+?)\.?\s*$", text, re.I | re.M)
+    if loc_m and not _la_gia_tri_trong(loc_m.group(1)):
         data["Dia_Diem"] = loc_m.group(1).strip()
 
-    # 2. Cán bộ
-    cb_kt = re.search(r"Đ/c\s+([^–\-\n]+?)\s+[–\-]\s+Tổ", text, re.I)
+    # 2. Cán bộ: "Đ/c <tên> – <chức vụ> tổ An ninh..." và "đồng chí: <tên> quản lý"
+    cb_kt = re.search(r"Đ/c\s+(.+?)\s+[–\-]\s*(.*?)\s*tổ an ninh", text, re.I)
     if cb_kt:
-        data["Can_Bo_KT"] = cb_kt.group(1).strip()
-    cb_ql = re.search(r"(?:đơn vị/\s*đồng chí|đồng chí)[:\s]+([^,\.\n]+?)\s+quản lý", text, re.I)
-    if cb_ql:
+        if not _la_gia_tri_trong(cb_kt.group(1)):
+            data["Can_Bo_KT"] = cb_kt.group(1).strip()
+        if not _la_gia_tri_trong(cb_kt.group(2)):
+            data["Chuc_Vu_KT"] = cb_kt.group(2).strip()
+    cb_ql = re.search(r"đồng chí[:\s]+(.+?)\s*quản lý", text, re.I)
+    if cb_ql and not _la_gia_tri_trong(cb_ql.group(1)):
         data["Can_Bo_Quan_Ly"] = cb_ql.group(1).strip()
+    elif len(doc.tables) > 1:
+        # Dự phòng: ô ký tên "CÁN BỘ QUẢN LÝ, SỬ DỤNG THIẾT BỊ" ở bảng cuối biên bản
+        try:
+            ten = doc.tables[1].cell(1, 2).text.strip()
+            if ten:
+                data["Can_Bo_Quan_Ly"] = ten
+        except Exception:
+            pass
 
-    # 3. Mật khẩu & Phân loại
-    if re.search(r"Đặt mật khẩu đăng nhập:\s*Có", text, re.I):
-        data["Mat_Khau"] = "Có đặt mật khẩu"
-    elif re.search(r"Đặt mật khẩu đăng nhập:[^\n]*không", text, re.I):
-        data["Mat_Khau"] = "Không đặt MK"
+    # 3. Mật khẩu & Phân loại - đọc ô tích trực tiếp từ XML
+    for p in paragraphs:
+        dau = p.text.strip().lower()
+        if dau.startswith("đặt mật khẩu đăng nhập"):
+            o = doc_o_tich(p)
+            if len(o) >= 2 and o[0][1] != o[1][1]:
+                data["Mat_Khau"] = "Có đặt mật khẩu" if o[0][1] else "Không đặt MK"
+        elif dau.startswith("có cung cấp mật khẩu"):
+            o = doc_o_tich(p)
+            if len(o) >= 2 and o[0][1] != o[1][1]:
+                data["Cung_Cap_MK"] = "Có" if o[0][1] else "Không"
+        elif dau.startswith("phân loại máy tính"):
+            da_tich = [nhan for nhan, tich in doc_o_tich(p) if tich and nhan]
+            if da_tich:
+                data["Phan_Loai_May"] = ", ".join(da_tich)
 
-    pl_m = re.search(r"Phân loại máy tính:\s*([^\n|]+)", text, re.I)
-    if pl_m:
-        data["Phan_Loai_May"] = pl_m.group(1).strip()
+    # 4. Thông số máy - đọc theo nhãn ở cột 1 của bảng thông tin (không phụ thuộc thứ tự dòng)
+    if doc.tables:
+        for row in doc.tables[0].rows:
+            if len(row.cells) < 2:
+                continue
+            nhan = row.cells[0].text.strip().lower()
+            gia_tri = row.cells[1].text.strip()
+            if not gia_tri:
+                continue
+            if nhan.startswith("tên máy tính"):
+                data["Ten_May"] = gia_tri
+            elif nhan.startswith("hệ điều hành"):
+                data["He_Dieu_Hanh"] = gia_tri
+            elif nhan.startswith("thời gian cài đặt"):
+                data["Ngay_Cai_Dat"] = gia_tri
+            elif nhan == "mac":
+                data["Dia_Chi_MAC"] = gia_tri
+            elif nhan == "ip":
+                data["Dia_Chi_IP"] = gia_tri
+            elif nhan.startswith("cấu hình máy tính"):
+                for key, pattern in (("CPU", r"^CPU:\s*(.+)$"), ("RAM", r"^RAM:\s*(.+)$"),
+                                     ("Loai_OCung", r"^Ổ cứng loại:\s*(.+)$"),
+                                     ("DungLuong_OCung", r"^Dung lượng:\s*(.+)$")):
+                    m = re.search(pattern, gia_tri, re.I | re.M)
+                    if m:
+                        data[key] = m.group(1).strip()
+            elif nhan.startswith("phần mềm diệt virus"):
+                data["Phan_Mem_Diet_Virus"] = gia_tri
+            elif nhan.startswith("phần mềm ứng dụng"):
+                data["Phan_Mem_Ung_Dung"] = gia_tri
+            elif nhan.startswith("tình trạng thiết bị"):
+                m = re.search(r"Kết nối Internet:\s*(.+?)\.?\s*$", gia_tri, re.I | re.M)
+                data["Ket_Noi_Mang"] = m.group(1).strip() if m else gia_tri
 
-    # 4. Thông số máy
-    name_m = re.search(r"Tên máy tính\s*\|\s*([^\n]+)", text, re.I)
-    if name_m:
-        data["Ten_May"] = name_m.group(1).strip()
-    os_m = re.search(r"Hệ điều hành\s*\|\s*([^\n]+)", text, re.I)
-    if os_m:
-        data["He_Dieu_Hanh"] = os_m.group(1).strip()
-    ins_m = re.search(r"Thời gian cài đặt\s*\|\s*([^\n]+)", text, re.I)
-    if ins_m:
-        data["Ngay_Cai_Dat"] = ins_m.group(1).strip()
-    ip_m = re.search(r"IP\s*\|\s*([^\n]+)", text, re.I)
-    if ip_m:
-        data["Dia_Chi_IP"] = ip_m.group(1).strip()
-    mac_m = re.search(r"MAC\s*\|\s*([^\n]+)", text, re.I)
-    if mac_m:
-        data["Dia_Chi_MAC"] = mac_m.group(1).strip()
+    # 5. Kết quả kiểm tra (mục II.1) - lấy các dòng auto_fill ghi thêm sau tiêu đề từng mục.
+    # Chỉ lấy lần khớp ĐẦU TIÊN: mục II.2 cũng có dòng "- Mã độc hoặc phần mềm độc hại...".
+    muc = {}
+    for p in paragraphs:
+        dau = p.text.strip().lower()
+        for key, tien_to in (("lo_hong", "- lỗ hổng bảo mật hệ điều hành"), ("ma_doc", "- mã độc"),
+                             ("usb", "- lịch sử kết nối các thiết bị ngoại vi"),
+                             ("internet", "- lịch sử kết nối internet")):
+            if dau.startswith(tien_to) and key not in muc:
+                muc[key] = p.text
 
-    # Bóc tách phần cứng tách riêng
-    cpu_p = re.search(r"CPU:\s*([^R\n|]+)", text, re.I)
-    if cpu_p: data["CPU"] = cpu_p.group(1).strip()
-    ram_p = re.search(r"RAM:\s*([^\n|Ổ]+)", text, re.I)
-    if ram_p: data["RAM"] = ram_p.group(1).strip()
-    disk_p = re.search(r"Ổ cứng loại:\s*([^\n|Dung]+)", text, re.I)
-    if disk_p: data["Loai_OCung"] = disk_p.group(1).strip()
-    cap_p = re.search(r"Dung lượng:\s*([^\n|]+)", text, re.I)
-    if cap_p: data["DungLuong_OCung"] = cap_p.group(1).strip()
-
-    # Diệt virus & Mạng
-    av_m = re.search(r"Phần mềm diệt virus\s*\|\s*([^\n]+)", text, re.I)
-    if av_m:
-        data["Phan_Mem_Diet_Virus"] = av_m.group(1).strip()
-    net_m = re.search(r"Kết nối Internet[:\s]*([^\n]+)", text, re.I)
-    if net_m:
-        data["Ket_Noi_Mang"] = net_m.group(1).strip()
-
-    # 5. Lỗ hổng bảo mật & Đánh giá nguy cơ
-    vuln_m = re.search(r"Phát hiện\s+(\d+)\s+lỗ hổng[^\(]*\((.*?)\)", text, re.I | re.DOTALL)
+    # 5a. Lỗ hổng
+    dong_lo_hong = _noi_dung_sau_tieu_de(muc.get("lo_hong", ""))
+    noi_dung_lo_hong = " ".join(dong_lo_hong)
+    vuln_m = re.search(r"Phát hiện\s+(\d+)\s+lỗ hổng[^\(]*\((.*?)\)", noi_dung_lo_hong, re.I | re.DOTALL)
     if vuln_m:
+        data["Tinh_Trang_Kiem_Tra_Lo_Hong"] = "Đã kiểm tra"
         data["So_Luong_Lo_Hong"] = int(vuln_m.group(1).strip())
-        vuln_list = re.findall(r"CVE-\d{4}-\d+", vuln_m.group(2))
-        data["Danh_Sach_Lo_Hong"] = vuln_list
-        data["Lo_Hong_Nguy_Hiem"] = [v for v in vuln_list if v in CRITICAL_VULNS_DICT]
+        vuln_list = re.findall(r"CVE-\d{4}-\d+", vuln_m.group(2), re.I)
+        data["Danh_Sach_Lo_Hong"] = [v.upper() for v in vuln_list]
+    elif re.search(r"Không phát hiện lỗ hổng", noi_dung_lo_hong, re.I):
+        data["Tinh_Trang_Kiem_Tra_Lo_Hong"] = "Đã kiểm tra"
+    elif re.search(r"CẢNH BÁO", noi_dung_lo_hong):
+        data["Tinh_Trang_Kiem_Tra_Lo_Hong"] = "Chưa kiểm tra (thiếu file CVE)"
+    data["Lo_Hong_Nguy_Hiem"] = [v for v in data["Danh_Sach_Lo_Hong"]
+                                 if v in CRITICAL_VULNS_DICT or muc_do_cve.get(v) == "CRITICAL"]
 
-    if data["So_Luong_Lo_Hong"] >= 20 or len(data["Lo_Hong_Nguy_Hiem"]) > 0:
-        data["Muc_Do_Rui_Ro"] = "Nguy cấp (Critical)"
-    elif data["So_Luong_Lo_Hong"] >= 10:
-        data["Muc_Do_Rui_Ro"] = "Cao (High)"
-    elif data["So_Luong_Lo_Hong"] > 0:
-        data["Muc_Do_Rui_Ro"] = "Trung bình (Medium)"
-    else:
-        data["Muc_Do_Rui_Ro"] = "An toàn"
+    # 5b. Mã độc: "1. <Họ mã độc>: <dấu hiệu>; ..." hoặc "Không phát hiện dấu hiệu (IOC)..."
+    dong_ma_doc = _noi_dung_sau_tieu_de(muc.get("ma_doc", ""))
+    phat_hien = [re.sub(r"^\d+\.\s*", "", d) for d in dong_ma_doc if re.match(r"^\d+\.\s*\S", d)]
+    if phat_hien:
+        data["Ma_Doc"] = "PHÁT HIỆN: " + " | ".join(phat_hien)
+        data["Ho_Ma_Doc"] = [d.split(":", 1)[0].strip() for d in phat_hien]
+    elif any(re.search(r"Không phát hiện", d, re.I) for d in dong_ma_doc):
+        data["Ma_Doc"] = "Không phát hiện"
+    elif any("CẢNH BÁO" in d for d in dong_ma_doc):
+        data["Ma_Doc"] = "Chưa kiểm tra (thiếu file IOC)"
 
-    # 6. Thiết bị USB / Ngoại vi
-    usb_items = re.findall(r"(?:Loại:\s*([^|]+)\|\s*Seri:\s*([^|]+)\|\s*Dung lượng:\s*([^|]+)\|\s*Tên:\s*([^0-9\n\r]+))", text)
-    if usb_items:
-        data["Lich_Su_USB"] = [f"{item[3].strip()} (Seri: {item[1].strip()})" for item in usb_items]
+    # 5c. Thiết bị ngoại vi / USB - mỗi dòng "N. Loại: .. | Seri: .. | Dung lượng: .. | Tên: .."
+    for d in _noi_dung_sau_tieu_de(muc.get("usb", "")):
+        m = re.match(r"^\d+\.\s*Loại:\s*(.*?)\s*\|\s*Seri:\s*(.*?)\s*\|\s*Dung lượng:\s*(.*?)\s*\|\s*Tên:\s*(.+)$", d)
+        if m:
+            data["Lich_Su_USB"].append(f"{m.group(4).strip()} [{m.group(1).strip()}, {m.group(3).strip()}] "
+                                       f"(Seri: {m.group(2).strip()})")
+            data["USB_Seri"].append(m.group(2).strip())
+        elif re.match(r"^\.\.\.\s*và\s+\d+", d):
+            data["Lich_Su_USB"].append(d)
 
+    # 5d. Lịch sử Internet (ghi cùng dòng với tiêu đề mục)
+    if muc.get("internet"):
+        m = re.search(r"\(liệt kê chi tiết nếu có\):\s*(.+)$", muc["internet"], re.I | re.S)
+        if m and m.group(1).strip():
+            data["Lich_Su_Internet"] = m.group(1).strip()
+
+    danh_gia_rui_ro(data, muc_do_cve)
     return data
+
+
+MUC_RUI_RO = ["An toàn", "Trung bình (Medium)", "Cao (High)", "Nguy cấp (Critical)"]
+
+
+def danh_gia_rui_ro(data, muc_do_cve):
+    """Chấm mức rủi ro theo nhiều tiêu chí (không chỉ số lượng lỗ hổng) và ghi lại LÝ DO,
+    để kiểm tra viên/lãnh đạo biết vì sao máy bị xếp mức đó và cần khắc phục gì."""
+    muc = 0
+    ly_do = []
+
+    def nang(len_muc, ly):
+        nonlocal muc
+        muc = max(muc, len_muc)
+        ly_do.append(ly)
+
+    if data["Ho_Ma_Doc"]:
+        nang(3, "Phát hiện dấu hiệu mã độc: " + ", ".join(data["Ho_Ma_Doc"]))
+    if data["Lo_Hong_Nguy_Hiem"]:
+        nang(3, f"{len(data['Lo_Hong_Nguy_Hiem'])} lỗ hổng mức NGUY CẤP chưa vá")
+    so = data["So_Luong_Lo_Hong"]
+    if so >= 20:
+        nang(3, f"{so} lỗ hổng chưa vá (≥ 20)")
+    elif so >= 10:
+        nang(2, f"{so} lỗ hổng chưa vá (≥ 10)")
+    elif so > 0:
+        cao = [v for v in data["Danh_Sach_Lo_Hong"] if muc_do_cve.get(v) == "HIGH"]
+        nang(2 if cao else 1, f"{so} lỗ hổng chưa vá" + (f" ({len(cao)} mức CAO)" if cao else ""))
+
+    # Hệ điều hành hết hỗ trợ: không còn bản vá bảo mật -> lỗ hổng mới sẽ không bao giờ được vá
+    hdh = data["He_Dieu_Hanh"].lower()
+    if re.search(r"windows\s*(xp|vista|7|8(\.1)?)\b", hdh):
+        nang(2, "Hệ điều hành đã hết hỗ trợ (không còn bản vá bảo mật)")
+    elif re.search(r"windows\s*10\b", hdh) and "ltsc" not in hdh and "ltsb" not in hdh:
+        nang(1, "Windows 10 hết hỗ trợ từ 14/10/2025 (trừ khi có đăng ký ESU) - cần nâng cấp")
+
+    phan_loai = data["Phan_Loai_May"].lower()
+    co_internet = "internet" in phan_loai or data["Ket_Noi_Mang"].lower().startswith("có")
+    if "nội bộ" in phan_loai and co_internet:
+        nang(2, "Máy nội bộ đồng thời kết nối Internet")
+    if data["Mat_Khau"] == "Không đặt MK":
+        nang(2 if co_internet else 1, "Không đặt mật khẩu đăng nhập")
+    if data["Cung_Cap_MK"] == "Có":
+        nang(1, "Cung cấp mật khẩu cho người khác")
+    if re.search(r"không (có|xác định|phát hiện)", data["Phan_Mem_Diet_Virus"], re.I):
+        nang(1, "Không xác định được phần mềm diệt virus")
+    for key, ten in (("Ma_Doc", "mã độc"), ("Tinh_Trang_Kiem_Tra_Lo_Hong", "lỗ hổng")):
+        if data[key].startswith("Chưa kiểm tra"):
+            nang(1, f"Chưa đối chiếu {ten} (thiếu dữ liệu) - cần kiểm tra lại")
+        elif data[key] == "Không rõ":
+            # Biên bản không có kết quả mục này (điền tay/sửa mẫu) - không được coi là "An toàn"
+            nang(1, f"Chưa đối chiếu {ten} (biên bản không ghi kết quả) - cần kiểm tra lại")
+
+    data["Muc_Do_Rui_Ro"] = MUC_RUI_RO[muc]
+    data["Ly_Do_Rui_Ro"] = ly_do
 
 
 class WorkerThread(QThread):
@@ -215,22 +393,30 @@ class WorkerThread(QThread):
     file_processed = pyqtSignal(dict)
     finished = pyqtSignal(list)
 
-    def __init__(self, folder_path):
+    file_error = pyqtSignal(str, str)
+
+    def __init__(self, folder_path, muc_do_cve=None):
         super().__init__()
         self.folder_path = folder_path
+        self.muc_do_cve = muc_do_cve or {}
 
     def run(self):
-        files = [f for f in os.listdir(self.folder_path) if f.endswith(".docx") and not f.startswith("~$")]
+        # Quét cả thư mục con (biên bản thường được xếp theo từng cơ quan/thôn/đợt kiểm tra)
+        files = []
+        for goc, _, ten_files in os.walk(self.folder_path):
+            for f in sorted(ten_files):
+                if f.lower().endswith(".docx") and not f.startswith("~$"):
+                    files.append(os.path.join(goc, f))
         total = len(files)
         results = []
-        for idx, f in enumerate(files):
-            file_path = os.path.join(self.folder_path, f)
+        for idx, file_path in enumerate(files):
             try:
-                res = parse_docx_content(file_path)
+                res = parse_docx_content(file_path, self.muc_do_cve)
+                res["File_Name"] = os.path.relpath(file_path, self.folder_path)
                 results.append(res)
                 self.file_processed.emit(res)
             except Exception as e:
-                print(f"Lỗi đọc file {f}: {e}")
+                self.file_error.emit(os.path.relpath(file_path, self.folder_path), str(e))
             if total > 0:
                 self.progress.emit(int((idx + 1) / total * 100))
         self.finished.emit(results)
@@ -319,6 +505,16 @@ def fetch_threatfox_recent(auth_key, days=7):
     return data.get("data", []) or []
 
 
+TEN_MIEN_HOP_PHAP = (
+    "github.com", "githubusercontent.com", "google.com", "googleapis.com", "googleusercontent.com",
+    "microsoft.com", "live.com", "sharepoint.com", "onedrive.com", "1drv.ms", "windows.net",
+    "dropbox.com", "dropboxusercontent.com", "discord.com", "discordapp.com", "discordapp.net",
+    "telegram.org", "t.me", "facebook.com", "fbcdn.net", "zalo.me", "amazonaws.com",
+    "cloudfront.net", "bitbucket.org", "gitlab.com", "pastebin.com", "mediafire.com",
+    "mega.nz", "4shared.com", "cloudflare.com", "workers.dev", "pages.dev", "azureedge.net",
+)
+
+
 def quy_doi_ioc_threatfox(item):
     """Đổi 1 IOC thô từ ThreatFox sang đúng định dạng dòng của malware_signatures.txt
     (chỉ giữ loại tương thích: sha256/domain/ip); trả về None nếu không khớp loại nào."""
@@ -334,8 +530,14 @@ def quy_doi_ioc_threatfox(item):
         return f"ip:{gia_tri.split(':')[0]}"
     if loai == "url":
         try:
-            ten_mien = urllib.parse.urlparse(gia_tri).hostname
-            return f"domain:{ten_mien}" if ten_mien else None
+            ten_mien = (urllib.parse.urlparse(gia_tri).hostname or "").lower()
+            # URL độc hại đặt trên dịch vụ hợp pháp (github, google drive, discord...) KHÔNG được
+            # đổi thành IOC tên miền: công cụ kiểm tra so khớp tên miền trong cache DNS, nên sẽ báo
+            # "có mã độc" oan cho mọi máy chỉ vì từng mở Google Drive/GitHub.
+            if not ten_mien or re.fullmatch(r"[\d.]+", ten_mien) or any(
+                    ten_mien == d or ten_mien.endswith("." + d) for d in TEN_MIEN_HOP_PHAP):
+                return None
+            return f"domain:{ten_mien}"
         except Exception:
             return None
     return None  # md5/win_registry_key/... - chưa có chỗ tương ứng trong định dạng hiện tại
@@ -466,10 +668,11 @@ class ATTTAnalysisTool(QMainWindow):
 
         # Bảng hiển thị
         self.table = QTableWidget()
-        self.table.setColumnCount(13)
+        self.table.setColumnCount(15)
         self.table.setHorizontalHeaderLabels([
             "STT", "Tên File", "Cán Bộ QL", "Tên Máy", "HĐH", "IP",
-            "CPU", "RAM", "Ổ Cứng", "Số Lỗ Hổng", "Mức Nguy Cơ", "Mã Độc", "Lịch Sử USB"
+            "CPU", "RAM", "Ổ Cứng", "Số Lỗ Hổng", "Mức Nguy Cơ", "Mã Độc", "Lịch Sử USB",
+            "Mật Khẩu", "Phân Loại"
         ])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         self.table.horizontalHeader().setStretchLastSection(True)
@@ -981,8 +1184,11 @@ class ATTTAnalysisTool(QMainWindow):
         self.lbl_status.setText("Đang đọc và phân tích dữ liệu...")
         self.progress_bar.setValue(0)
 
-        self.thread = WorkerThread(folder)
+        self._file_loi = []
+        muc_do_cve = doc_muc_do_cve(self.cfg.get("duong_dan_cve", ""))
+        self.thread = WorkerThread(folder, muc_do_cve)
         self.thread.file_processed.connect(self.add_row_to_table)
+        self.thread.file_error.connect(lambda f, e: self._file_loi.append(f"{f}: {e}"))
         self.thread.progress.connect(self.progress_bar.setValue)
         self.thread.finished.connect(self.process_finished)
         self.thread.start()
@@ -1007,20 +1213,36 @@ class ATTTAnalysisTool(QMainWindow):
             risk_item.setForeground(QColor("#D32F2F"))
         elif "Cao" in item["Muc_Do_Rui_Ro"]:
             risk_item.setForeground(QColor("#F57C00"))
+        elif "Trung bình" in item["Muc_Do_Rui_Ro"]:
+            risk_item.setForeground(QColor("#B8860B"))
         else:
             risk_item.setForeground(QColor("#2E7D32"))
         risk_item.setFont(QFont("Arial", 9, QFont.Weight.Bold))
+        # Rê chuột lên ô mức nguy cơ để xem lý do bị xếp mức đó
+        risk_item.setToolTip("\n".join(item["Ly_Do_Rui_Ro"]) or "Không ghi nhận vấn đề")
         self.table.setItem(row, 10, risk_item)
 
-        self.table.setItem(row, 11, QTableWidgetItem(item["Ma_Doc"]))
+        malware_item = QTableWidgetItem(item["Ma_Doc"])
+        if item["Ho_Ma_Doc"]:
+            malware_item.setForeground(QColor("#D32F2F"))
+            malware_item.setFont(QFont("Arial", 9, QFont.Weight.Bold))
+        self.table.setItem(row, 11, malware_item)
         self.table.setItem(row, 12, QTableWidgetItem("; ".join(item["Lich_Su_USB"]) if item["Lich_Su_USB"] else "Không có"))
+        self.table.setItem(row, 13, QTableWidgetItem(item["Mat_Khau"]))
+        self.table.setItem(row, 14, QTableWidgetItem(item["Phan_Loai_May"]))
 
     def process_finished(self, results):
         self.data_list = results
         self.btn_run.setEnabled(True)
         self.lbl_status.setText(f"Đã xử lý xong {len(results)} biên bản! Nhấp đúp vào dòng để mở file Word.")
         self.update_analysis_tab()
-        QMessageBox.information(self, "Thông báo", f"Đã quét và trích xuất thành công {len(results)} biên bản!")
+        thong_bao = f"Đã quét và trích xuất thành công {len(results)} biên bản!"
+        if self._file_loi:
+            thong_bao += (f"\n\n{len(self._file_loi)} file KHÔNG đọc được (cần kiểm tra lại):\n"
+                          + "\n".join(self._file_loi[:15]))
+            QMessageBox.warning(self, "Thông báo", thong_bao)
+        else:
+            QMessageBox.information(self, "Thông báo", thong_bao)
 
     def open_selected_docx(self, index):
         row = index.row()
@@ -1065,7 +1287,27 @@ class ATTTAnalysisTool(QMainWindow):
             all_vulns.extend(d["Danh_Sach_Lo_Hong"])
         vuln_counts = Counter(all_vulns).most_common(10)
 
-        vuln_report = "=== TOP 10 LỖ HỔNG BẢO MẬT XUẤT HIỆN NHIỀU NHẤT ===\n\n"
+        vuln_report = "=== CẢNH BÁO TRỌNG ĐIỂM (cần xử lý ngay) ===\n\n"
+        nhom_canh_bao = [
+            ("Phát hiện dấu hiệu mã độc", lambda d: d["Ho_Ma_Doc"],
+             lambda d: ", ".join(d["Ho_Ma_Doc"])),
+            ("Có lỗ hổng mức NGUY CẤP chưa vá", lambda d: d["Lo_Hong_Nguy_Hiem"],
+             lambda d: ", ".join(d["Lo_Hong_Nguy_Hiem"])),
+            ("Máy nội bộ đồng thời kết nối Internet",
+             lambda d: "Máy nội bộ đồng thời kết nối Internet" in d["Ly_Do_Rui_Ro"], lambda d: ""),
+            ("Không đặt mật khẩu đăng nhập", lambda d: d["Mat_Khau"] == "Không đặt MK", lambda d: ""),
+            ("Hệ điều hành hết/sắp hết hỗ trợ",
+             lambda d: any("hết hỗ trợ" in x for x in d["Ly_Do_Rui_Ro"]), lambda d: d["He_Dieu_Hanh"]),
+            ("Chưa đối chiếu được mã độc/lỗ hổng (thiếu dữ liệu)",
+             lambda d: any(x.startswith("Chưa đối chiếu") for x in d["Ly_Do_Rui_Ro"]), lambda d: ""),
+        ]
+        for tieu_de, dieu_kien, chi_tiet in nhom_canh_bao:
+            may = [d for d in self.data_list if dieu_kien(d)]
+            vuln_report += f"■ {tieu_de}: {len(may)} máy\n"
+            for d in may:
+                ct = chi_tiet(d)
+                vuln_report += f"    - {d['Ten_May']} ({d['Can_Bo_Quan_Ly']})" + (f": {ct}" if ct else "") + "\n"
+        vuln_report += "\n=== TOP 10 LỖ HỔNG BẢO MẬT XUẤT HIỆN NHIỀU NHẤT ===\n\n"
         for rank, (vuln, cnt) in enumerate(vuln_counts, 1):
             desc = f" ({CRITICAL_VULNS_DICT[vuln]})" if vuln in CRITICAL_VULNS_DICT else ""
             vuln_report += f"{rank:02d}. {vuln:<18}{desc} -> {cnt}/{total_machines} máy vi tính\n"
@@ -1077,7 +1319,27 @@ class ATTTAnalysisTool(QMainWindow):
             for usb in d["Lich_Su_USB"]:
                 usb_list.append(f"[{d['Ten_May']} - {d['Can_Bo_Quan_Ly']}] -> {usb}")
 
-        usb_report = f"=== TỔNG HỢP {len(usb_list)} THIẾT BỊ NGOẠI VI GHI NHẬN ===\n\n"
+        # USB (cùng số seri) đã cắm vào nhiều máy - đặc biệt là "cầu nối" giữa máy có Internet và
+        # máy nội bộ/độc lập: con đường lây nhiễm mã độc và làm lộ lọt dữ liệu điển hình.
+        seri_may = {}
+        for d in self.data_list:
+            for seri in set(d["USB_Seri"]):
+                if seri and seri.lower() not in ("không xác định", "không rõ", "n/a", "?"):
+                    seri_may.setdefault(seri, []).append(d)
+        usb_report = "=== THIẾT BỊ LƯU TRỮ DÙNG CHUNG NHIỀU MÁY ===\n\n"
+        dung_chung = {s: ds for s, ds in seri_may.items() if len(ds) > 1}
+        if not dung_chung:
+            usb_report += "Không phát hiện thiết bị cùng số seri trên nhiều máy.\n"
+        for seri, ds in sorted(dung_chung.items(), key=lambda x: -len(x[1])):
+            co_net = [d for d in ds if "internet" in d["Phan_Loai_May"].lower()
+                      or d["Ket_Noi_Mang"].lower().startswith("có")]
+            khong_net = [d for d in ds if d not in co_net]
+            canh_bao = " ⚠ CẦU NỐI máy Internet <-> máy không Internet" if co_net and khong_net else ""
+            usb_report += f"Seri {seri}: {len(ds)} máy{canh_bao}\n"
+            for d in ds:
+                usb_report += f"    - {d['Ten_May']} ({d['Can_Bo_Quan_Ly']}) - {d['Phan_Loai_May']}\n"
+
+        usb_report += f"\n=== TỔNG HỢP {len(usb_list)} THIẾT BỊ NGOẠI VI GHI NHẬN ===\n\n"
         usb_report += "\n".join(usb_list) if usb_list else "Không ghi nhận thiết bị lưu trữ ngoài cắm vào hệ thống."
         self.txt_usb_analysis.setText(usb_report)
 
@@ -1099,7 +1361,9 @@ class ATTTAnalysisTool(QMainWindow):
             "STT", "Tên Tệp", "Thời Gian KT", "Địa Điểm", "Cán Bộ KT", "Cán Bộ QL",
             "Mật Khẩu", "Phân Loại Máy", "Tên Máy", "HĐH", "Ngày Cài", "IP", "MAC",
             "CPU", "RAM", "Loại Ổ Cứng", "Dung Lượng Ổ", "Phần Mềm Diệt Virus", "Kết Nối Mạng",
-            "Số Lượng Lỗ Hổng", "Mức Rủi Ro", "Danh Sách Lỗ Hổng Bảo Mật", "Tình Trạng Mã Độc", "Lịch Sử Cắm USB"
+            "Số Lượng Lỗ Hổng", "Mức Rủi Ro", "Danh Sách Lỗ Hổng Bảo Mật", "Tình Trạng Mã Độc", "Lịch Sử Cắm USB",
+            "Chức Vụ Cán Bộ KT", "Cung Cấp MK Cho Người Khác", "Phần Mềm Ứng Dụng", "Lịch Sử Internet",
+            "Lý Do Xếp Mức Rủi Ro"
         ]
         ws.append(headers)
 
@@ -1122,7 +1386,9 @@ class ATTTAnalysisTool(QMainWindow):
                 d["Mat_Khau"], d["Phan_Loai_May"], d["Ten_May"], d["He_Dieu_Hanh"], d["Ngay_Cai_Dat"],
                 d["Dia_Chi_IP"], d["Dia_Chi_MAC"], d["CPU"], d["RAM"], d["Loai_OCung"], d["DungLuong_OCung"],
                 d["Phan_Mem_Diet_Virus"], d["Ket_Noi_Mang"], d["So_Luong_Lo_Hong"], d["Muc_Do_Rui_Ro"],
-                ", ".join(d["Danh_Sach_Lo_Hong"]), d["Ma_Doc"], "; ".join(d["Lich_Su_USB"])
+                ", ".join(d["Danh_Sach_Lo_Hong"]), d["Ma_Doc"], "; ".join(d["Lich_Su_USB"]),
+                d["Chuc_Vu_KT"], d["Cung_Cap_MK"], d["Phan_Mem_Ung_Dung"], d["Lich_Su_Internet"],
+                "; ".join(d["Ly_Do_Rui_Ro"])
             ]
             ws.append(row_data)
             for c_idx in range(1, len(headers) + 1):
@@ -1130,6 +1396,14 @@ class ATTTAnalysisTool(QMainWindow):
                 cell.font = Font(name="Arial", size=10)
                 cell.border = thin_border
                 cell.alignment = Alignment(vertical="center", wrap_text=True)
+            mau_rui_ro = {"Nguy cấp": "F8CBAD", "Cao": "FCE4D6", "Trung bình": "FFF2CC"}
+            for tu_khoa, mau in mau_rui_ro.items():
+                if tu_khoa in d["Muc_Do_Rui_Ro"]:
+                    ws.cell(row=idx + 1, column=headers.index("Mức Rủi Ro") + 1).fill = PatternFill(
+                        start_color=mau, end_color=mau, fill_type="solid")
+            if d["Ho_Ma_Doc"]:
+                ws.cell(row=idx + 1, column=headers.index("Tình Trạng Mã Độc") + 1).font = Font(
+                    name="Arial", size=10, bold=True, color="C00000")
 
         for col in ws.columns:
             max_len = max(len(str(c.value or '')) for c in col)
@@ -1137,7 +1411,15 @@ class ATTTAnalysisTool(QMainWindow):
             ws.column_dimensions[col_letter].width = min(max(max_len + 3, 12), 45)
 
         ws.row_dimensions[1].height = 26
-        wb.save(save_path)
+        ws.freeze_panes = "C2"
+        ws.auto_filter.ref = ws.dimensions
+        try:
+            wb.save(save_path)
+        except PermissionError:
+            QMessageBox.critical(self, "Lỗi ghi file",
+                                 "Không ghi được file Excel - có thể file đang được mở trong Excel. "
+                                 "Hãy đóng file rồi xuất lại.")
+            return
         QMessageBox.information(self, "Thành công", f"Đã xuất báo cáo Excel thành công tại:\n{save_path}")
 
 
