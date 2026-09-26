@@ -1,0 +1,10 @@
+{
+  "duong_dan_python": "E:/Program Files/Python/Python311/python.exe",
+  "thu_muc_xuat": "E:/1. BUILD_FILMWWARE/TOOL_KTRA_ANATTT/V_1_5",
+  "duong_dan_cve": "E:/1. BUILD_FILMWWARE/TOOL_KTRA_ANATTT/V_1_5/windows_vulnerabilities.txt",
+  "duong_dan_ioc": "E:/1. BUILD_FILMWWARE/TOOL_KTRA_ANATTT/V_1_5/malware_signatures.txt",
+  "duong_dan_script": "E:/1. BUILD_FILMWWARE/TOOL_KTRA_ANATTT/V_1_5/auto_fill_bien_ban.py",
+  "duong_dan_mau_docx": "E:/1. BUILD_FILMWWARE/TOOL_KTRA_ANATTT/V_1_5/mau_bien_ban.docx",
+  "duong_dan_icon": "E:/1. BUILD_FILMWWARE/TOOL_KTRA_ANATTT/V_1_5/letter.ico",
+  "tu_tang_phien_ban": false
+}
