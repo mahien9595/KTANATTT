@@ -292,7 +292,8 @@ def schedule_self_cleanup(shutdown=False):
         return False
     exe_name = os.path.basename(exe_path)
     targets = [exe_path]
-    for name in ("mau_bien_ban.docx", "malware_signatures.txt", "windows_vulnerabilities.txt"):
+    for name in ("mau_bien_ban.docx", "malware_signatures.txt", "windows_vulnerabilities.txt",
+                 "bien_ban_key.dat"):
         p = os.path.join(base_dir, name)
         if os.path.exists(p):
             targets.append(p)
@@ -1564,6 +1565,7 @@ def fill_form(template_path, output_path, malware_file, vuln_file, manual_data=N
     internet_history = get_internet_history_text(online_now)
 
     step(7, "Đang đối chiếu lỗ hổng bảo mật hệ điều hành...")
+    vuln_findings = []
     if not os.path.exists(vuln_file):
         vuln_lines = ["CẢNH BÁO: Không tìm thấy file danh sách CVE; bỏ qua bước đối chiếu lỗ hổng."]
     else:
@@ -1571,6 +1573,7 @@ def fill_form(template_path, output_path, malware_file, vuln_file, manual_data=N
         vuln_lines = format_vuln_text(vuln_findings)
 
     step(8, "Đang đối chiếu dấu hiệu mã độc (IOC)...")
+    malware_findings = []
     if not os.path.exists(malware_file):
         malware_lines = ["CẢNH BÁO: Không tìm thấy file danh sách IOC; bỏ qua bước quét mã độc."]
     else:
@@ -1712,8 +1715,114 @@ def fill_form(template_path, output_path, malware_file, vuln_file, manual_data=N
         pass
 
     doc.save(output_path)
+
+    # Ghi file dữ liệu kèm (.json) có chữ ký HMAC để công cụ tổng hợp xác minh biên bản không bị sửa.
+    try:
+        _ghi_sidecar_toan_ven(
+            output_path,
+            os_info=os_info, computer_name=computer_name, mac=mac_addr, ip=ip_addr,
+            hw=hw, av=av_name, top_apps=top_apps, password_status=password_status,
+            network_class=network_class, online=online_now,
+            vuln_findings=vuln_findings, malware_findings=malware_findings,
+            peripheral_items=peripheral_items, manual_data=manual_data,
+            vuln_file=vuln_file, malware_file=malware_file,
+        )
+    except Exception as e:
+        print(f"(Cảnh báo) Không ghi được file kèm toàn vẹn: {e}")
+
     print(f"\nĐã điền xong biên bản: {output_path}")
     return output_path
+
+
+# ============================================================
+# TOÀN VẸN BIÊN BẢN (chữ ký HMAC-SHA256) - phục vụ tính pháp lý
+# ============================================================
+# Khoá mặc định khi chưa nhúng khoá riêng lúc build. Công cụ TỔNG HỢP có thể sinh khoá riêng và
+# nhúng vào .exe (file bien_ban_key.dat) để chỉ bộ công cụ của đơn vị mới tạo/kiểm được chữ ký hợp lệ.
+DEFAULT_INTEGRITY_KEY = "ANATTT-CAX-TriPhu-2026-bien-ban-integrity-default-key"
+
+
+def _integrity_key():
+    p = _data_file("bien_ban_key.dat")
+    try:
+        if os.path.exists(p):
+            with open(p, "r", encoding="utf-8") as f:
+                k = f.read().strip()
+                if k:
+                    return k
+    except Exception:
+        pass
+    return os.environ.get("ANATTT_INTEGRITY_KEY", DEFAULT_INTEGRITY_KEY)
+
+
+def _canonical_json(obj):
+    return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _tinh_hmac(key, obj):
+    import hmac as _hmac
+    return _hmac.new(key.encode("utf-8"), _canonical_json(obj).encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _sha256_file(path):
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return None
+
+
+def _ghi_sidecar_toan_ven(output_path, os_info, computer_name, mac, ip, hw, av, top_apps,
+                          password_status, network_class, online, vuln_findings, malware_findings,
+                          peripheral_items, manual_data, vuln_file, malware_file):
+    """Ghi file <biên_bản>.attt.json chứa dữ liệu thu thập có cấu trúc + chữ ký HMAC.
+    Công cụ tổng hợp ưu tiên đọc file này (đáng tin hơn regex trên docx) và phát hiện nếu bị sửa."""
+    cves = []
+    for f in vuln_findings:
+        m = re.search(r"CVE-\d{4}-\d+", f)
+        if m:
+            cves.append(m.group(0))
+    ho_ma_doc = [str(f).split(":", 1)[0].strip() for f in malware_findings]
+
+    payload = {
+        "schema": "anattt-bienban/1",
+        "app_version": APP_VERSION,
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "computer_name": computer_name,
+        "os_display": os_info.get("os_display", ""),
+        "os_caption": os_info.get("ten_he_dieu_hanh", ""),
+        "os_build_full": os_info.get("build_full", ""),
+        "ngay_cai": os_info.get("ngay_cai", ""),
+        "ban_quyen": os_info.get("ban_quyen", ""),
+        "mac": mac,
+        "ip": ip,
+        "hardware": hw,
+        "antivirus": av,
+        "top_apps": top_apps,
+        "password_has": password_status,
+        "network_class": network_class,
+        "online": bool(online),
+        "vuln_cves": cves,
+        "vuln_count": len(vuln_findings),
+        "vuln_raw": vuln_findings,
+        "malware_families": ho_ma_doc,
+        "malware_raw": malware_findings,
+        "peripherals": peripheral_items,
+        "data_version_cve": doc_ngay_du_lieu(vuln_file) or "",
+        "data_version_ioc": doc_ngay_du_lieu(malware_file) or "",
+        "manual": manual_data,
+        "docx_file": os.path.basename(output_path),
+        "docx_sha256": _sha256_file(output_path),
+    }
+    goi = {"payload": payload, "hmac": _tinh_hmac(_integrity_key(), payload)}
+    sidecar_path = os.path.splitext(output_path)[0] + ".attt.json"
+    with open(sidecar_path, "w", encoding="utf-8") as f:
+        json.dump(goi, f, ensure_ascii=False, indent=2)
+    return sidecar_path
+
 
 APP_VERSION = "1.7"
 APP_NAME = "Công cụ kiểm tra ANATTT"

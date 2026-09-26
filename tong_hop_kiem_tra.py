@@ -2,6 +2,8 @@ import sys
 import os
 import re
 import json
+import hashlib
+import hmac
 import subprocess
 import urllib.request
 import urllib.parse
@@ -22,6 +24,8 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, QThread, Signal as pyqtSignal
 from PySide6.QtGui import QFont, QColor
+
+APP_VERSION_TH = "3.0.0"
 
 # Nơi lưu các đường dẫn/cấu hình cho tab "Cập nhật dữ liệu & Build" - cùng thư mục với
 # chương trình đang chạy (script hoặc .exe), để không mất khi đổi máy/đổi thư mục làm việc.
@@ -266,6 +270,8 @@ def parse_docx_content(file_path, muc_do_cve=None):
         "USB_Seri": [],
         "Muc_Do_Rui_Ro": "An toàn",
         "Ly_Do_Rui_Ro": [],
+        "Toan_Ven": "Không có file kèm (biên bản cũ/thủ công)",
+        "Nguon_Du_Lieu": "docx",
     }
 
     # 1. Thời gian & Địa điểm
@@ -458,6 +464,154 @@ def danh_gia_rui_ro(data, muc_do_cve):
     data["Ly_Do_Rui_Ro"] = ly_do
 
 
+# ============================================================
+# TOÀN VẸN BIÊN BẢN: xác minh chữ ký HMAC của file .attt.json do auto_fill ghi kèm
+# ============================================================
+DEFAULT_INTEGRITY_KEY = "ANATTT-CAX-TriPhu-2026-bien-ban-integrity-default-key"
+
+
+def lay_integrity_key(cfg):
+    """Khoá xác minh: ưu tiên khoá riêng của đơn vị trong cấu hình, nếu chưa có thì dùng khoá mặc định
+    (khớp với auto_fill khi chưa nhúng khoá riêng)."""
+    return (cfg.get("integrity_key") or "").strip() or DEFAULT_INTEGRITY_KEY
+
+
+def _canonical_json(obj):
+    return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _tinh_hmac(key, obj):
+    import hmac
+    return hmac.new(key.encode("utf-8"), _canonical_json(obj).encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _sha256_file(path):
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return None
+
+
+def xac_minh_toan_ven(docx_path, key):
+    """Tìm file kèm <biên_bản>.attt.json, kiểm chữ ký HMAC và so mã băm docx.
+    Trả về (trang_thai, payload_hoặc_None):
+      - 'Không có file kèm (biên bản cũ/thủ công)'
+      - 'Chữ ký SAI - nghi bị giả mạo'         (HMAC không khớp -> KHÔNG tin dữ liệu)
+      - 'Docx ĐÃ bị sửa sau khi tạo'           (HMAC đúng, mã băm docx khác -> dùng dữ liệu JSON gốc)
+      - 'Hợp lệ'                               (HMAC đúng, docx khớp nguyên trạng)
+    """
+    sidecar = os.path.splitext(docx_path)[0] + ".attt.json"
+    if not os.path.exists(sidecar):
+        return "Không có file kèm (biên bản cũ/thủ công)", None
+    try:
+        with open(sidecar, "r", encoding="utf-8") as f:
+            goi = json.load(f)
+        payload = goi.get("payload")
+        chu_ky = goi.get("hmac")
+        if not isinstance(payload, dict) or not chu_ky:
+            return "File kèm hỏng định dạng", None
+        import hmac as _hmac
+        if not _hmac.compare_digest(chu_ky, _tinh_hmac(key, payload)):
+            return "Chữ ký SAI - nghi bị giả mạo", None
+        docx_hash = _sha256_file(docx_path)
+        if payload.get("docx_sha256") and docx_hash and payload["docx_sha256"] != docx_hash:
+            return "Docx ĐÃ bị sửa sau khi tạo", payload
+        return "Hợp lệ", payload
+    except Exception:
+        return "File kèm hỏng định dạng", None
+
+
+def parse_sidecar(payload, file_path, muc_do_cve=None):
+    """Dựng dữ liệu phân tích TRỰC TIẾP từ file kèm đã ký (đáng tin hơn regex trên docx)."""
+    muc_do_cve = muc_do_cve or {}
+    hw = payload.get("hardware") or {}
+    manual = payload.get("manual") or {}
+    ph = payload.get("password_has")
+    nc = payload.get("network_class")
+    online = bool(payload.get("online"))
+
+    phan_loai = {"noi_bo": "Nội bộ", "doc_lap": "Độc lập"}.get(nc, "Không rõ")
+    if online and phan_loai != "Không rõ":
+        phan_loai += ", Internet"
+
+    gio = manual.get("gio", ""); phut = manual.get("phut", "")
+    ngay = manual.get("ngay", ""); thang = manual.get("thang", ""); nam = manual.get("nam", "")
+    thoi_gian = f"{gio}:{phut} - {ngay}/{thang}/{nam}" if (gio or ngay) else "Không rõ"
+
+    ho_ma_doc = payload.get("malware_families") or []
+    cves = [c.upper() for c in (payload.get("vuln_cves") or [])]
+
+    usb, seri = [], []
+    for it in payload.get("peripherals") or []:
+        ten = (it.get("ten") or "").strip()
+        s = (it.get("serial") or "").strip()
+        usb.append(f"{ten} [{it.get('loai','')}, {it.get('dung_luong','')}] (Seri: {s})")
+        seri.append(s)
+
+    data = {
+        "File_Path": file_path,
+        "File_Name": os.path.basename(file_path),
+        "Thoi_Gian_KT": thoi_gian,
+        "Dia_Diem": manual.get("dia_diem", "") or "Không rõ",
+        "Can_Bo_KT": manual.get("ten_can_bo", "") or "Không rõ",
+        "Chuc_Vu_KT": manual.get("chuc_vu", ""),
+        "Can_Bo_Quan_Ly": manual.get("ten_doi_tuong", "") or "Không rõ",
+        "Mat_Khau": {True: "Có đặt mật khẩu", False: "Không đặt MK"}.get(ph, "Không rõ"),
+        "Cung_Cap_MK": "Không rõ",
+        "Phan_Loai_May": phan_loai,
+        "Ten_May": payload.get("computer_name", "") or "Không rõ",
+        "He_Dieu_Hanh": payload.get("os_display") or payload.get("os_caption", "") or "Không rõ",
+        "Ngay_Cai_Dat": payload.get("ngay_cai", "") or "Không rõ",
+        "Dia_Chi_IP": payload.get("ip", "") or "Không rõ",
+        "Dia_Chi_MAC": payload.get("mac", "") or "Không rõ",
+        "CPU": hw.get("cpu", "") or "Không rõ",
+        "RAM": str(hw.get("ram_gb", "")) or "Không rõ",
+        "Loai_OCung": hw.get("loai_o_cung", "") or "Không rõ",
+        "DungLuong_OCung": hw.get("dung_luong_o_cung", "") or "Không rõ",
+        "Phan_Mem_Diet_Virus": payload.get("antivirus", "") or "Không rõ",
+        "Phan_Mem_Ung_Dung": payload.get("top_apps", "") or "Không rõ",
+        "Ket_Noi_Mang": "Có" if online else "Không",
+        "Lich_Su_Internet": "Đang có kết nối Internet." if online else "Hiện không kết nối Internet.",
+        "Tinh_Trang_Kiem_Tra_Lo_Hong": "Đã kiểm tra",
+        "So_Luong_Lo_Hong": int(payload.get("vuln_count") or 0),
+        "Danh_Sach_Lo_Hong": cves,
+        "Lo_Hong_Nguy_Hiem": [v for v in cves if v in CRITICAL_VULNS_DICT or muc_do_cve.get(v) == "CRITICAL"],
+        "Ma_Doc": ("PHÁT HIỆN: " + " | ".join(payload.get("malware_raw") or ho_ma_doc)) if ho_ma_doc else "Không phát hiện",
+        "Ho_Ma_Doc": ho_ma_doc,
+        "Lich_Su_USB": usb,
+        "USB_Seri": seri,
+        "Muc_Do_Rui_Ro": "An toàn",
+        "Ly_Do_Rui_Ro": [],
+        "Toan_Ven": "Hợp lệ",
+        "Nguon_Du_Lieu": "file kèm đã ký (.attt.json)",
+    }
+    danh_gia_rui_ro(data, muc_do_cve)
+    return data
+
+
+def phan_tich_bien_ban(file_path, muc_do_cve=None, key=None):
+    """Phân tích 1 biên bản: ưu tiên file kèm đã ký (.attt.json), dùng docx làm dự phòng.
+    Luôn gắn trạng thái toàn vẹn để công cụ cảnh báo biên bản bị sửa/giả mạo."""
+    key = key or DEFAULT_INTEGRITY_KEY
+    trang_thai, payload = xac_minh_toan_ven(file_path, key)
+    if payload is not None:  # HMAC hợp lệ -> tin dữ liệu trong file kèm
+        data = parse_sidecar(payload, file_path, muc_do_cve)
+        data["Toan_Ven"] = trang_thai
+        return data
+    # Không có file kèm, chữ ký sai, hoặc file kèm hỏng -> đọc docx và gắn cảnh báo tương ứng
+    data = parse_docx_content(file_path, muc_do_cve)
+    data["Toan_Ven"] = trang_thai
+    if trang_thai.startswith("Chữ ký SAI"):
+        if "Nghi biên bản bị giả mạo (chữ ký sai)" not in data["Ly_Do_Rui_Ro"]:
+            data["Ly_Do_Rui_Ro"].insert(0, "Nghi biên bản bị giả mạo (chữ ký sai)")
+        data["Muc_Do_Rui_Ro"] = "Nguy cấp (Critical)"
+    return data
+
+
 class WorkerThread(QThread):
     progress = pyqtSignal(int)
     file_processed = pyqtSignal(dict)
@@ -465,10 +619,11 @@ class WorkerThread(QThread):
 
     file_error = pyqtSignal(str, str)
 
-    def __init__(self, folder_path, muc_do_cve=None):
+    def __init__(self, folder_path, muc_do_cve=None, integrity_key=None):
         super().__init__()
         self.folder_path = folder_path
         self.muc_do_cve = muc_do_cve or {}
+        self.integrity_key = integrity_key or DEFAULT_INTEGRITY_KEY
 
     def run(self):
         # Quét cả thư mục con (biên bản thường được xếp theo từng cơ quan/thôn/đợt kiểm tra)
@@ -481,7 +636,7 @@ class WorkerThread(QThread):
         results = []
         for idx, file_path in enumerate(files):
             try:
-                res = parse_docx_content(file_path, self.muc_do_cve)
+                res = phan_tich_bien_ban(file_path, self.muc_do_cve, self.integrity_key)
                 res["File_Name"] = os.path.relpath(file_path, self.folder_path)
                 results.append(res)
                 self.file_processed.emit(res)
@@ -799,7 +954,7 @@ class BuildThread(QThread):
 class ATTTAnalysisTool(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("HỆ THỐNG TỔNG HỢP & PHÂN TÍCH BIÊN BẢN KIỂM TRA ATTT - V2.0")
+        self.setWindowTitle(f"HỆ THỐNG TỔNG HỢP & PHÂN TÍCH BIÊN BẢN KIỂM TRA ATTT - v{APP_VERSION_TH}")
         self.resize(1280, 780)
         self.data_list = []
         self.cfg = load_config()
@@ -867,11 +1022,11 @@ class ATTTAnalysisTool(QMainWindow):
 
         # Bảng hiển thị
         self.table = QTableWidget()
-        self.table.setColumnCount(15)
+        self.table.setColumnCount(16)
         self.table.setHorizontalHeaderLabels([
             "STT", "Tên File", "Cán Bộ QL", "Tên Máy", "HĐH", "IP",
             "CPU", "RAM", "Ổ Cứng", "Số Lỗ Hổng", "Mức Nguy Cơ", "Mã Độc", "Lịch Sử USB",
-            "Mật Khẩu", "Phân Loại"
+            "Mật Khẩu", "Phân Loại", "Toàn Vẹn"
         ])
         self.table.setAlternatingRowColors(True)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
@@ -1431,6 +1586,23 @@ class ATTTAnalysisTool(QMainWindow):
             f = self._duong_dan_edits[key].text().strip()
             if f and os.path.exists(f):
                 cmd.append(f"--include-data-files={f}={os.path.basename(f)}")
+
+        # Nhúng KHOÁ TOÀN VẸN (bien_ban_key.dat): auto_fill dùng khoá này ký biên bản, công cụ tổng hợp
+        # dùng chính khoá này xác minh. Sinh ngẫu nhiên 1 lần rồi lưu trong cấu hình để các đợt build sau
+        # dùng cùng khoá (nếu không, biên bản đợt trước sẽ báo 'chữ ký sai').
+        if not self.cfg.get("integrity_key"):
+            import secrets
+            self.cfg["integrity_key"] = secrets.token_hex(32)
+            save_config(self.cfg)
+            self.txt_build_log.append("Đã sinh khoá toàn vẹn mới cho đơn vị (lưu trong cấu hình).")
+        try:
+            key_file = os.path.join(os.path.dirname(CONFIG_PATH), "bien_ban_key.dat")
+            with open(key_file, "w", encoding="utf-8") as kf:
+                kf.write(self.cfg["integrity_key"])
+            cmd.append(f"--include-data-files={key_file}=bien_ban_key.dat")
+        except Exception as e:
+            self.txt_build_log.append(f"⚠ Không ghi được khoá toàn vẹn: {e} - biên bản sẽ dùng khoá mặc định.")
+
         cmd.append(duong_dan_script)
 
         self.txt_build_log.append("Lệnh build: " + " ".join(cmd))
@@ -1588,7 +1760,7 @@ class ATTTAnalysisTool(QMainWindow):
 
         self._file_loi = []
         muc_do_cve = doc_muc_do_cve(self.cfg.get("duong_dan_cve", ""))
-        self.thread = WorkerThread(folder, muc_do_cve)
+        self.thread = WorkerThread(folder, muc_do_cve, lay_integrity_key(self.cfg))
         self.thread.file_processed.connect(self.add_row_to_table)
         self.thread.file_error.connect(lambda f, e: self._file_loi.append(f"{f}: {e}"))
         self.thread.progress.connect(self.progress_bar.setValue)
@@ -1632,6 +1804,20 @@ class ATTTAnalysisTool(QMainWindow):
         self.table.setItem(row, 12, QTableWidgetItem("; ".join(item["Lich_Su_USB"]) if item["Lich_Su_USB"] else "Không có"))
         self.table.setItem(row, 13, QTableWidgetItem(item["Mat_Khau"]))
         self.table.setItem(row, 14, QTableWidgetItem(item["Phan_Loai_May"]))
+
+        tv = item.get("Toan_Ven", "")
+        tv_item = QTableWidgetItem(tv)
+        tv_item.setToolTip("Nguồn dữ liệu: " + item.get("Nguon_Du_Lieu", "docx"))
+        if tv == "Hợp lệ":
+            tv_item.setForeground(QColor("#2E7D32"))
+        elif tv.startswith("Chữ ký SAI"):
+            tv_item.setForeground(QColor("#D32F2F"))
+            tv_item.setFont(QFont("Arial", 9, QFont.Weight.Bold))
+        elif tv.startswith("Docx"):
+            tv_item.setForeground(QColor("#B8860B"))
+        else:
+            tv_item.setForeground(QColor("#666"))
+        self.table.setItem(row, 15, tv_item)
 
     def process_finished(self, results):
         self.data_list = results
@@ -1702,6 +1888,12 @@ class ATTTAnalysisTool(QMainWindow):
              lambda d: any("hết hỗ trợ" in x for x in d["Ly_Do_Rui_Ro"]), lambda d: d["He_Dieu_Hanh"]),
             ("Chưa đối chiếu được mã độc/lỗ hổng (thiếu dữ liệu)",
              lambda d: any(x.startswith("Chưa đối chiếu") for x in d["Ly_Do_Rui_Ro"]), lambda d: ""),
+            ("BIÊN BẢN NGHI BỊ GIẢ MẠO (chữ ký sai)",
+             lambda d: d.get("Toan_Ven", "").startswith("Chữ ký SAI"), lambda d: ""),
+            ("Biên bản bị chỉnh sửa sau khi tạo (docx đổi so với bản gốc đã ký)",
+             lambda d: d.get("Toan_Ven", "").startswith("Docx"), lambda d: ""),
+            ("Biên bản không có file kèm đã ký (không kiểm chứng được nguồn gốc)",
+             lambda d: d.get("Toan_Ven", "").startswith("Không có file kèm"), lambda d: ""),
         ]
         for tieu_de, dieu_kien, chi_tiet in nhom_canh_bao:
             may = [d for d in self.data_list if dieu_kien(d)]
@@ -1765,7 +1957,7 @@ class ATTTAnalysisTool(QMainWindow):
             "CPU", "RAM", "Loại Ổ Cứng", "Dung Lượng Ổ", "Phần Mềm Diệt Virus", "Kết Nối Mạng",
             "Số Lượng Lỗ Hổng", "Mức Rủi Ro", "Danh Sách Lỗ Hổng Bảo Mật", "Tình Trạng Mã Độc", "Lịch Sử Cắm USB",
             "Chức Vụ Cán Bộ KT", "Cung Cấp MK Cho Người Khác", "Phần Mềm Ứng Dụng", "Lịch Sử Internet",
-            "Lý Do Xếp Mức Rủi Ro"
+            "Lý Do Xếp Mức Rủi Ro", "Toàn Vẹn Biên Bản", "Nguồn Dữ Liệu"
         ]
         ws.append(headers)
 
@@ -1790,7 +1982,7 @@ class ATTTAnalysisTool(QMainWindow):
                 d["Phan_Mem_Diet_Virus"], d["Ket_Noi_Mang"], d["So_Luong_Lo_Hong"], d["Muc_Do_Rui_Ro"],
                 ", ".join(d["Danh_Sach_Lo_Hong"]), d["Ma_Doc"], "; ".join(d["Lich_Su_USB"]),
                 d["Chuc_Vu_KT"], d["Cung_Cap_MK"], d["Phan_Mem_Ung_Dung"], d["Lich_Su_Internet"],
-                "; ".join(d["Ly_Do_Rui_Ro"])
+                "; ".join(d["Ly_Do_Rui_Ro"]), d.get("Toan_Ven", ""), d.get("Nguon_Du_Lieu", "")
             ]
             ws.append(row_data)
             for c_idx in range(1, len(headers) + 1):

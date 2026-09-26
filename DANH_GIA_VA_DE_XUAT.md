@@ -1,7 +1,9 @@
 # Đánh giá và đề xuất phương hướng phát triển — Công cụ TỔNG HỢP & TẠO CÔNG CỤ KIỂM TRA
 
-Phạm vi: `TONG HOP VA TAO CONG CU KIEM TRA.py`. Công cụ này là phần mềm dành cho **cơ quan quản lý**
-(Tổ ANATTT Công an xã). File `auto_fill_bien_ban_V1.6.py` là công cụ chạy trên từng máy được kiểm tra.
+Phạm vi: `tong_hop_kiem_tra.py` (trước đây là `TONG HOP VA TAO CONG CU KIEM TRA.py`), phiên bản **3.0.0** —
+phần mềm dành cho **cơ quan quản lý** (Tổ ANATTT Công an xã). File `auto_fill_bien_ban.py`
+(trước đây là `auto_fill_bien_ban_V1.6.py`) là công cụ chạy trên từng máy được kiểm tra.
+Hai file đã được đổi tên bỏ số phiên bản để không phải đổi tên mỗi lần nâng cấp.
 Ở đây chỉ đọc file đó để biết định dạng biên bản mà công cụ tổng hợp phải phân tích.
 
 ## 1. Hiện trạng
@@ -104,16 +106,29 @@ Việc so theo `build.UBR` đã xử lý phần lớn báo động thừa. Còn 
 - CVE cũ (trước khi có dữ liệu FixedBuild) vẫn chỉ so theo KB nên có thể còn báo thừa — nên **tải lại nhiều tháng** để bổ sung cột build.
 - Với dòng Windows không có trong danh sách FixedBuild, công cụ giữ nguyên cảnh báo (an toàn về phía thận trọng) — kiểm tra viên xác minh thêm.
 
-### 3.2. Biên bản .docx vừa là báo cáo, vừa là dữ liệu — dễ vỡ và dễ bị sửa
-- Chỉ cần sửa mẫu (thêm/bớt một dòng) là bộ phân tích có thể đọc sai.
-- Người được kiểm tra có thể sửa file Word (xoá dòng "mã độc") mà không ai phát hiện.
+## 2c. Giai đoạn 3 — ĐÃ THỰC HIỆN (toàn vẹn biên bản, giá trị pháp lý)
 
-→ Đề xuất: công cụ kiểm tra xuất **thêm một file dữ liệu `.json`** kèm biên bản, có **mã kiểm tra toàn vẹn**
-(HMAC với khoá nhúng lúc build ở Tab 3, hoặc ký số). Công cụ tổng hợp sẽ:
-1. ưu tiên đọc JSON, dùng docx làm dự phòng;
-2. **cảnh báo biên bản bị chỉnh sửa** khi nội dung docx không khớp JSON hoặc chữ ký sai.
+Đây là tính năng quan trọng nhất cho vai trò cơ quan quản lý. Trước đây người được kiểm tra có thể mở
+file Word xóa dòng "mã độc" mà không ai phát hiện, và biên bản .docx vừa là báo cáo vừa là dữ liệu nên dễ đọc sai.
 
-Đây là tính năng quan trọng nhất cho vai trò cơ quan quản lý, vì nó bảo đảm giá trị pháp lý của kết quả kiểm tra.
+Cách làm:
+- Công cụ kiểm tra ghi kèm mỗi biên bản một file **`<tên>.attt.json`** chứa toàn bộ dữ liệu thu thập có cấu trúc,
+  cùng **chữ ký HMAC-SHA256** và mã băm của file .docx.
+- Khoá ký được công cụ tổng hợp **sinh ngẫu nhiên một lần** (lưu trong cấu hình) và **nhúng vào .exe** khi build
+  (`bien_ban_key.dat`). Nhờ vậy chỉ bộ công cụ của đơn vị mới tạo/kiểm được chữ ký hợp lệ.
+- Công cụ tổng hợp khi đọc biên bản sẽ **ưu tiên dữ liệu trong file kèm đã ký** (đáng tin hơn regex trên docx),
+  và gắn trạng thái toàn vẹn (cột "Toàn Vẹn" trên bảng + Excel + cảnh báo tab 2):
+  - **Hợp lệ** — chữ ký đúng, docx nguyên trạng;
+  - **Docx đã bị sửa sau khi tạo** — chữ ký đúng nhưng file .docx đã đổi (dùng dữ liệu JSON gốc, cần lưu ý);
+  - **Chữ ký SAI - nghi bị giả mạo** — xếp ngay mức Nguy cấp để soát lại;
+  - **Không có file kèm** — biên bản cũ/thủ công, không kiểm chứng được nguồn gốc.
+
+> Đã kiểm chứng cả 4 trạng thái. Lưu ý: khoá nhúng trong .exe chỉ chống sửa từ người dùng thông thường,
+> không phải chữ ký số pháp lý (PKI). Nếu cần giá trị pháp lý cao hơn, giai đoạn sau có thể thay HMAC bằng
+> ký số bằng chứng thư số của đơn vị.
+
+### 3.2. (Đã xử lý ở giai đoạn 3) Toàn vẹn biên bản
+Xem mục 2c. Hướng nâng cao còn lại: thay HMAC bằng chữ ký số PKI để có giá trị pháp lý đầy đủ.
 
 ### 3.3. Chưa có lịch sử giữa các đợt kiểm tra
 Mỗi lần mở chương trình chỉ xem được một thư mục, nên không trả lời được các câu hỏi như:
@@ -159,12 +174,12 @@ Có thể xuất riêng cho từng cơ quan một thông báo khắc phục.
 |---|---|---|
 | **1 – Đúng dữ liệu** | Mục 2 | **Đã thực hiện** |
 | **2 – Tin cậy dữ liệu** | Mục 2b (FixedBuild/UBR, KEV, lọc IOC, kiểm tra trước build, ngày dữ liệu, manifest, giao diện) | **Đã thực hiện** — sửa cả 2 công cụ |
-| **3 – Toàn vẹn biên bản** | 3.2 (JSON + HMAC/ký số, phát hiện biên bản bị sửa) | Giá trị pháp lý của kết quả. Cần sửa cả 2 công cụ |
+| **3 – Toàn vẹn biên bản** | Mục 2c (file kèm .attt.json + HMAC, khoá nhúng khi build, phát hiện sửa/giả mạo) | **Đã thực hiện** — sửa cả 2 công cụ |
 | **4 – Quản lý theo thời gian** | 3.3 (SQLite, so sánh đợt), 3.4 (danh mục, độ phủ, chống trùng) | Chỉ sửa công cụ tổng hợp |
 | **5 – Văn bản đầu ra** | 3.5 (báo cáo cấp trên, thông báo khắc phục từng đơn vị) | Chỉ sửa công cụ tổng hợp |
 | 6 – Mở rộng tiêu chí | Tiêu chí mới do công cụ kiểm tra thu thập: tường lửa, SMBv1, RDP, BitLocker, ngày cập nhật Windows gần nhất, tuổi bản mẫu nhận diện của Defender, tài khoản quản trị | Công cụ tổng hợp chỉ cần thêm quy tắc chấm điểm |
 
-Giai đoạn 3 tiếp theo tác động trực tiếp đến **giá trị pháp lý** của kết luận kiểm tra, nên ưu tiên hơn các tính năng hiển thị.
+Giai đoạn 4 và 5 tiếp theo (lịch sử qua các đợt, danh mục tài sản, văn bản đầu ra) chỉ cần sửa công cụ tổng hợp.
 
 ## 5. Quy trình chuẩn trước mỗi đợt kiểm tra (bảo đảm dữ liệu mới và tính pháp lý)
 
@@ -176,7 +191,8 @@ Giai đoạn 3 tiếp theo tác động trực tiếp đến **giá trị pháp 
 5. Bấm **Build**. Công cụ tự kiểm tra dữ liệu; nếu có lỗi sẽ dừng và báo. Build xong sinh `auto_fill_bien_ban.exe` + `manifest.json`.
 6. Chép cả thư mục xuất (exe + manifest.json) sang USB, mang đi kiểm tra.
 7. Trên mỗi máy: chạy exe (nên "Run as administrator"), thanh trạng thái hiển thị ngày dữ liệu để xác nhận là bản mới.
-8. Thu biên bản .docx về, dùng tab 1/2 của công cụ TỔNG HỢP để phân tích và xuất Excel.
+   Mỗi máy sinh ra biên bản `.docx` **và file kèm `.attt.json`** (chữ ký toàn vẹn) — **thu về cả hai file, giữ cạnh nhau**.
+8. Thu biên bản về, dùng tab 1/2 của công cụ TỔNG HỢP để phân tích, kiểm tra cột "Toàn Vẹn" và xuất Excel.
 
 > Lưu ý pháp lý: biên bản sẽ tự ghi "đối chiếu bằng bộ dữ liệu cập nhật đến ngày …". `manifest.json` lưu lại
 > phiên bản công cụ + mã băm để đối chứng đợt kiểm tra đã dùng bộ dữ liệu nào.
