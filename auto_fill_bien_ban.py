@@ -1104,6 +1104,18 @@ def get_installed_hotfixes():
         data = [data]
     return set(x.upper() for x in data)
 
+
+def get_last_update_date():
+    """Ngày cập nhật bản vá gần nhất của máy (bản ghi InstalledOn mới nhất trong Get-HotFix).
+    Dùng để ghi 'máy đã cập nhật đến thời điểm nào' - trả về chuỗi dd/mm/yyyy hoặc None."""
+    raw = run_ps("Get-HotFix | Sort-Object InstalledOn -Descending | "
+                 "Select-Object -First 1 -ExpandProperty InstalledOn")
+    if not raw:
+        return None
+    if isinstance(raw, list):
+        raw = raw[0] if raw else None
+    return _fmt_wmi_date(raw) if raw else None
+
 def parse_vuln_file(path):
     entries = []
     if not os.path.exists(path):
@@ -1504,6 +1516,23 @@ def set_table_cell_text(cell, text):
         run = cell.paragraphs[0].add_run(text)
         run.font.name = "Times New Roman"
 
+
+def _set_cell_bold_center(cell, text):
+    """Điền tên vào ô ký tên với chữ ĐẬM, căn giữa - cho dòng thứ 2 bảng ký cuối biên bản in đẹp hơn."""
+    para = cell.paragraphs[0]
+    merge_para_runs(para)
+    if para.runs:
+        para.runs[0].text = text
+        run = para.runs[0]
+    else:
+        run = para.add_run(text)
+    run.font.name = "Times New Roman"
+    run.font.bold = True
+    try:
+        para.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    except Exception:
+        pass
+
 def replace_in_cell_by_pattern(cell, pattern_replacements):
     for para in cell.paragraphs:
         merge_para_runs(para)
@@ -1776,16 +1805,26 @@ def fill_form(template_path, output_path, malware_file, vuln_file, manual_data=N
     step(6, "Đang kiểm tra tình trạng thiết bị / kết nối Internet...")
     online_now = check_internet_now()
     device_status = get_device_status_text()
-    
+    # Trạng thái tem kiểm tra an ninh, an toàn (kiểm tra viên tự nhìn và tích tay ở giao diện)
+    tem_text = {"co": "Có dán tem kiểm tra an ninh, an toàn.",
+                "khong": "Chưa dán tem kiểm tra an ninh, an toàn."}.get(
+                    str(manual_data.get("tem", "")).lower(), "")
+    if tem_text:
+        device_status = tem_text + " " + device_status
+
     internet_history = get_internet_history_text(online_now)
 
     step(7, "Đang đối chiếu lỗ hổng bảo mật hệ điều hành...")
     vuln_findings = []
+    ngay_va_may = get_last_update_date()
+    dong_muc_va = (f"Máy đã cập nhật bản vá đến: {ngay_va_may or 'không xác định'} "
+                   f"(bản dựng {os_info.get('build_full') or os_info.get('build') or '?'}).")
     if not os.path.exists(vuln_file):
-        vuln_lines = ["CẢNH BÁO: Không tìm thấy file danh sách CVE; bỏ qua bước đối chiếu lỗ hổng."]
+        vuln_lines = [dong_muc_va,
+                      "CẢNH BÁO: Không tìm thấy file danh sách CVE; bỏ qua bước đối chiếu lỗ hổng."]
     else:
         vuln_findings, vuln_can_verify = scan_os_vulnerabilities(vuln_file, os_info["build"], os_info.get("ubr"))
-        vuln_lines = format_vuln_text(vuln_findings, vuln_can_verify)
+        vuln_lines = [dong_muc_va] + format_vuln_text(vuln_findings, vuln_can_verify)
 
     step(8, "Đang đối chiếu dấu hiệu mã độc (IOC)...")
     malware_findings = []
@@ -1863,16 +1902,19 @@ def fill_form(template_path, output_path, malware_file, vuln_file, manual_data=N
     set_table_cell_text(table.rows[7].cells[1], phan_mem_text)
     
     conn_type = get_connection_type() if online_now else ""
-    set_table_cell_text(table.rows[8].cells[1], f"Kết nối Internet: {'Có' + conn_type if online_now else 'Không'}.")
+    tinh_trang_o = (tem_text + " " if tem_text else "") + \
+                   f"Kết nối Internet: {'Có' + conn_type if online_now else 'Không'}."
+    set_table_cell_text(table.rows[8].cells[1], tinh_trang_o)
 
-    # Bảng ký tên cuối biên bản: ô hàng 2 cột 1 = cán bộ kiểm tra; ô hàng 2 cột 3 = người/đơn vị
+    # Bảng ký tên cuối biên bản: ô hàng 2 cột 1 = cán bộ kiểm tra; ô hàng 2 cột 3 = người/đơn vị.
+    # Đặt CHỮ ĐẬM (và căn giữa) cho dòng thứ 2 của bảng để in ra đẹp hơn.
     try:
         if len(doc.tables) > 1:
             sign_table = doc.tables[1]
             if manual_data.get("ten_can_bo"):
-                set_table_cell_text(sign_table.cell(1, 0), manual_data["ten_can_bo"])
+                _set_cell_bold_center(sign_table.cell(1, 0), manual_data["ten_can_bo"])
             if manual_data.get("ten_doi_tuong"):
-                set_table_cell_text(sign_table.cell(1, 2), manual_data["ten_doi_tuong"])
+                _set_cell_bold_center(sign_table.cell(1, 2), manual_data["ten_doi_tuong"])
     except Exception:
         pass
 
@@ -2342,6 +2384,14 @@ def run_gui_app(template_path, output_path, malware_file, vuln_file):
     nguoi_cap_ent.grid(row=cc_row + 1, column=1, sticky="ew", padx=15, pady=5)
     _bind_auto_cap(nguoi_cap_ent)
 
+    # Ô tích thủ công: máy có dán tem kiểm tra an ninh, an toàn hay không (nhìn bằng mắt thường)
+    ttk.Label(form_frame, text="Tem kiểm tra an ninh, an toàn",
+              style="Field.TLabel").grid(row=cc_row + 2, column=0, sticky="w", pady=5)
+    tem_var = tk.StringVar(value="Chưa dán")
+    tem_combo = ttk.Combobox(form_frame, textvariable=tem_var, values=["Chưa dán", "Có dán tem"],
+                             state="readonly", width=39, font=("Segoe UI", 10))
+    tem_combo.grid(row=cc_row + 2, column=1, sticky="ew", padx=15, pady=5)
+
     form_frame.columnconfigure(1, weight=1)
 
     status_label = ttk.Label(root, text="", foreground="#374151", font=("Segoe UI", 9),
@@ -2494,6 +2544,7 @@ def run_gui_app(template_path, output_path, malware_file, vuln_file):
         # Lựa chọn cung cấp mật khẩu cho người khác (tự tích vào biên bản)
         manual_data["cung_cap_mk"] = "co" if cung_cap_var.get() == "Có" else "khong"
         manual_data["nguoi_duoc_cap"] = auto_capitalize(nguoi_cap_ent.get().strip())
+        manual_data["tem"] = "co" if tem_var.get() == "Có dán tem" else "khong"
 
         want_admin = False
         if not is_admin():

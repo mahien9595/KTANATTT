@@ -1185,6 +1185,12 @@ class ATTTAnalysisTool(QMainWindow):
         self.chk_cve_chi_khai_thac.setChecked(self.cfg.get("cve_chi_khai_thac", False))
         cve_layout.addWidget(self.chk_cve_chi_khai_thac)
 
+        self.chk_cve_lam_moi = QCheckBox("Làm mới danh sách mỗi đợt (thay thế toàn bộ file - chỉ giữ lỗ hổng vừa tải)")
+        self.chk_cve_lam_moi.setChecked(self.cfg.get("cve_lam_moi", True))
+        self.chk_cve_lam_moi.setToolTip("Bật: mỗi đợt kiểm tra chỉ mang theo lỗ hổng mới nhất, máy chỉ cần đối chiếu "
+                                        "bản vá gần đây. Tắt: bổ sung nối tiếp vào file cũ.")
+        cve_layout.addWidget(self.chk_cve_lam_moi)
+
         self.table_cve = QTableWidget()
         self.table_cve.setColumnCount(5)
         self.table_cve.setHorizontalHeaderLabels(["Chọn", "CVE", "Khai thác", "Mức độ", "KB / Build đã vá"])
@@ -1416,7 +1422,10 @@ class ATTTAnalysisTool(QMainWindow):
         if not hasattr(self, "_cve_data"):
             QMessageBox.warning(self, "Chưa có dữ liệu", "Bấm 'Tải CVE tháng này' trước.")
             return
-        da_co = self._doc_cve_id_da_co()
+        lam_moi = self.chk_cve_lam_moi.isChecked()
+        self.cfg["cve_lam_moi"] = lam_moi
+        save_config(self.cfg)
+        da_co = set() if lam_moi else self._doc_cve_id_da_co()
         dong_moi = []
         for row in range(self.table_cve.rowCount()):
             if self.table_cve.item(row, 0).checkState() != Qt.CheckState.Checked:
@@ -1435,17 +1444,32 @@ class ATTTAnalysisTool(QMainWindow):
             QMessageBox.information(self, "Không có gì để lưu",
                                      "Không có CVE mới nào được chọn (có thể đã có sẵn trong file).")
             return
+        hom_nay = datetime.now().strftime('%d/%m/%Y')
         try:
-            with open(duong_dan, "a", encoding="utf-8") as f:
-                f.write(f"\n# --- Bổ sung tự động từ MSRC ngày {datetime.now().strftime('%d/%m/%Y')} ---\n")
-                for dong in dong_moi:
-                    f.write(dong + "\n")
-            _cap_nhat_data_version(duong_dan)
+            if lam_moi:
+                # Làm mới: thay thế toàn bộ file, chỉ giữ lỗ hổng vừa tải (mỗi đợt mang danh sách mới nhất)
+                if os.path.exists(duong_dan):
+                    import shutil
+                    shutil.copy2(duong_dan, duong_dan + ".bak")  # sao lưu bản cũ phòng khi cần
+                with open(duong_dan, "w", encoding="utf-8") as f:
+                    f.write(f"# DATA_VERSION: {hom_nay}\n")
+                    f.write("# Danh sach lo hong Windows - LAM MOI tu MSRC (chi giu lo hong moi nhat).\n")
+                    f.write("# Dinh dang: CVE|Ten|Muc do|KB(;)|Build da va(;)|Ghi chu\n")
+                    for dong in dong_moi:
+                        f.write(dong + "\n")
+            else:
+                with open(duong_dan, "a", encoding="utf-8") as f:
+                    f.write(f"\n# --- Bổ sung tự động từ MSRC ngày {hom_nay} ---\n")
+                    for dong in dong_moi:
+                        f.write(dong + "\n")
+                _cap_nhat_data_version(duong_dan)
         except Exception as e:
             QMessageBox.critical(self, "Lỗi ghi file", str(e))
             return
-        QMessageBox.information(self, "Đã lưu", f"Đã thêm {len(dong_moi)} CVE mới vào file.")
-        self.lbl_cve_status.setText(f"Đã lưu {len(dong_moi)} CVE mới.")
+        cach = "Đã làm mới danh sách" if lam_moi else "Đã thêm"
+        QMessageBox.information(self, "Đã lưu", f"{cach}: {len(dong_moi)} CVE."
+                                + (" (bản cũ sao lưu ở file .bak)" if lam_moi else ""))
+        self.lbl_cve_status.setText(f"{cach}: {len(dong_moi)} CVE.")
 
     # ---------------- IOC (ThreatFox) ----------------
     def fetch_ioc(self):

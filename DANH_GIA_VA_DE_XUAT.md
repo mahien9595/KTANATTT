@@ -127,6 +127,13 @@ thanh trạng thái dữ liệu (ngày CVE/IOC, số mục) và quyền Administ
 - **Lọc lại danh sách thiết bị ngoại vi:** chỉ liệt kê chi tiết các loại có ý nghĩa (USB lưu trữ, ổ cứng gắn ngoài,
   điện thoại, máy in, chuột, bàn phím); các thiết bị nội bộ/không rõ (webcam, bluetooth, cảm biến vân tay,
   "USB Input Device" chung chung...) chỉ **đếm số lượng**: "N thiết bị khác (không rõ tên loại thiết bị)".
+- **Tem kiểm tra an ninh, an toàn (tích thủ công):** giao diện thêm ô chọn "Có dán tem / Chưa dán"; kiểm tra viên
+  nhìn bằng mắt rồi chọn, biên bản tự thêm câu trạng thái tem vào mục "Tình trạng thiết bị" (cả ô bảng I.1 và mục II.1).
+- **Báo mốc cập nhật bản vá:** mục lỗ hổng ghi thêm "Máy đã cập nhật bản vá đến: <ngày> (bản dựng ...)" — lấy ngày
+  bản vá gần nhất (Get-HotFix). Mỗi đợt công cụ tổng hợp chỉ mang danh sách lỗ hổng mới nhất (tùy chọn "Làm mới danh sách"
+  ghi đè file, có sao lưu .bak), nên máy chỉ cần đối chiếu các bản vá gần đây và ghi số lượng lỗ hổng chưa vá.
+- **Bảng ký cuối biên bản in đẹp hơn:** tên cán bộ kiểm tra và cán bộ quản lý (dòng 2 của bảng ký) mặc định
+  **in đậm, căn giữa**.
 
 ## 3. Hạn chế còn tồn tại (chưa sửa — cần quyết định hướng đi)
 
